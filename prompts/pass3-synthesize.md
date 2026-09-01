@@ -38,7 +38,8 @@ short — everything below it must be complete, not a further summary.
 Every sentence from transcript file rewritten and 
 Every extract.md's numbered list sentence, enriched with extra info 
 adding them all from background.md as flowing academic prose,
-nothing left out. Organize each sentence using sections, 
+nothing left out but remove sources (Wikipedia / Wiktionary / arXiv / DuckDuckGo) 
+and the related URLs. Organize each sentence using sections.
 
 ## Domande aperte e note critiche
 Every caveat from extract.md, plus anything where the speaker's claim and

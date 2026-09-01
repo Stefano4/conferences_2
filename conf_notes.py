@@ -177,59 +177,90 @@ def run_pi(
             f"pi call failed (exit {result.returncode}). See {logfile} for details."
         )
 
-
 def transcribe_with_gemini(audio: Path) -> str:
-    """Transcribe via Gemini Flash (cloud) using the standard google-genai SDK.
-    Uses free tier compatible model with File API upload."""
+    """Transcribe audio via Gemini 3.5 Transcribe using the Gemini Files API."""
     if genai is None:
-        raise RuntimeError("google-genai not installed. Run: pip install google-genai")
+        raise RuntimeError(
+            "google-genai not installed. Run: pip install google-genai"
+        )
 
-    client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY from env
+    client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
 
     # 1. Upload audio file to Google's temporary storage
     logger.debug("Uploading audio file %s to Gemini...", audio.name)
     audio_file = client.files.upload(file=str(audio))
-    logger.debug("Gemini upload complete: uri=%s name=%s", audio_file.uri, audio_file.name)
+
+    logger.debug(
+        "Gemini upload complete: uri=%s name=%s",
+        audio_file.uri,
+        audio_file.name,
+    )
 
     # 2. Wait until the file is fully processed (ACTIVE)
     poll_start = time.monotonic()
     poll_timeout = 180
+
     while audio_file.state and audio_file.state.name == "PROCESSING":
         if time.monotonic() - poll_start > poll_timeout:
             raise RuntimeError(
-                f"Gemini file {audio_file.name} still PROCESSING after {poll_timeout}s"
+                f"Gemini file {audio_file.name} still PROCESSING "
+                f"after {poll_timeout}s"
             )
-        logger.debug("  Gemini file %s state=%s, waiting...", audio_file.name, audio_file.state.name)
+
+        logger.debug(
+            "  Gemini file %s state=%s, waiting...",
+            audio_file.name,
+            audio_file.state.name,
+        )
+
         time.sleep(3)
         audio_file = client.files.get(name=audio_file.name)
 
     if audio_file.state.name != "ACTIVE":
-        raise RuntimeError(f"Gemini file {audio_file.name} failed to process: state={audio_file.state.name}")
+        raise RuntimeError(
+            f"Gemini file {audio_file.name} failed to process: "
+            f"state={audio_file.state.name}"
+        )
 
     try:
-        # 3. Request verbatim transcription using standard model generate_content
-        logger.debug("Sending transcription request to gemini...")
+        # 3. Request verbatim transcription
+        logger.debug("Sending transcription request to Gemini...")
+
         interaction = client.interactions.create(
             model="gemini-3.5-transcribe",
             input=[
                 {
-            "type": "audio",
-            "uri": audio_file,
-            "mime_type": audio_file.mime_type,
+                    "type": "audio",
+                    "uri": audio_file.uri,
+                    "mime_type": audio_file.mime_type,
                 }
-            ]
+            ],
+            generation_config={
+                "transcription_config": {
+                    "mode": {
+                        "type": "verbatim",
+                    }
+                }
+            },
         )
-        # Extract the final transcription
+
+        # 4. Extract the final transcription
         text = (interaction.output_text or "").strip()
+
         if not text:
             raise RuntimeError("Gemini returned an empty transcript")
+
         return text
+
     finally:
-        # 4. Clean up file from Google Cloud Storage
+        # 5. Clean up uploaded file
         try:
             client.files.delete(name=audio_file.name)
         except Exception:
-            logger.debug("Could not delete uploaded Gemini file %s (non-fatal)", audio_file.name)
+            logger.debug(
+                "Could not delete uploaded Gemini file %s (non-fatal)",
+                audio_file.name,
+            )
 
 
 def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
