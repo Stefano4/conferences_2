@@ -208,15 +208,19 @@ def transcribe_with_gemini(audio: Path) -> str:
 
     try:
         # 3. Request verbatim transcription using standard model generate_content
-        logger.debug("Sending transcription request to gemini-2.5-flash...")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                audio_file,
-                "Please provide a complete, verbatim transcription of this audio without summarizing or omitting any details."
+        logger.debug("Sending transcription request to gemini...")
+        interaction = client.interactions.create(
+            model="gemini-3.5-transcribe",
+            input=[
+                {
+            "type": "audio",
+            "uri": audio_file,
+            "mime_type": audio_file.mime_type,
+                }
             ]
         )
-        text = (response.text or "").strip()
+        # Extract the final transcription
+        text = (interaction.output_text or "").strip()
         if not text:
             raise RuntimeError("Gemini returned an empty transcript")
         return text
