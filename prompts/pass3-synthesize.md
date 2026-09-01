@@ -35,18 +35,10 @@ states an official session title, use that instead of generating one.
 short — everything below it must be complete, not a further summary.
 
 ## Conferenza
-Every sentence from transcript file rewritten and enriched with extra info 
-(or corrected when there are transcription issues).
-Crossing each extract.md's numbered list, as flowing academic prose,
-organized by sections and theme, but with nothing left out. 
-Each claim stays attributed to the speaker (e.g. "Il relatore sostiene che..."), 
-never stated as established fact. Do not add supporting evidence that 
-isn't already in background.md.
-
-## Contesto e approfondimenti
-Full paragraphs drawing on every background.md entry not already folded
-into "Concetti chiave" detail, clearly separated from "Argomentazioni del
-relatore", each citing its source.
+Every sentence from transcript file rewritten and 
+Every extract.md's numbered list sentence, enriched with extra info 
+adding them all from background.md as flowing academic prose,
+nothing left out. Organize each sentence using sections, 
 
 ## Domande aperte e note critiche
 Every caveat from extract.md, plus anything where the speaker's claim and

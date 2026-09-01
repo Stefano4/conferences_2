@@ -33,10 +33,9 @@ spoken — no explanation.
 People, organizations, papers, products mentioned by name.
 
 ## Speaker's claims & arguments
-Numbered list. Each item: a one-sentence paraphrase of a specific claim or
-argument the speaker makes, plus the closest verbatim phrase from the
-transcript it's based on (under 20 words). Do not soften, generalize, or add
-nuance the speaker didn't state.
+Numbered list of paragraphs. Rewrite, sentence by sentence, the speaker speech.
+Use the closest verbatim phrase from the transcript it's based on. 
+Do not soften, generalize, or add nuance the speaker didn't state.
 
 ## Explicit open questions / caveats
 Anything the speaker themselves flagged as uncertain, contested, or
