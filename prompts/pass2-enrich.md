@@ -19,7 +19,11 @@ Technical notes for the curl calls below:
 
 For EACH item under "Topics & concepts mentioned" and "Named entities" in
 extract.md, work through this fallback chain and stop at the first source
-that returns real content:
+that returns real content. First check extract.md's "Classificazione"
+section — the arXiv step (3) applies ONLY if it says "Scienza". For any
+other classification (Arte, Letteratura, Altro), skip straight from step 2
+to step 4 — arXiv is a research-paper database and isn't a relevant source
+for non-scientific talks.
 
 1. Italian Wikipedia full-text search (more forgiving than title-prefix
    matching):
@@ -35,8 +39,9 @@ that returns real content:
    Italian first:
    curl -s "https://it.wiktionary.org/api/rest_v1/page/summary/<TERM>"
 
-3. If the term looks like a paper, method, or research topic, try arXiv
-   (abstracts will typically be in English — paraphrase into Italian):
+3. ONLY IF the talk is classified as "Scienza": if the term looks like a
+   paper, method, or research topic, try arXiv (abstracts will typically
+   be in English — paraphrase into Italian):
    curl -s "http://export.arxiv.org/api/query?search_query=all:<TERM>&max_results=1"
    Extract the <title>, <summary>, and <id> (URL) from the returned XML.
 
@@ -48,9 +53,10 @@ that returns real content:
    HTML. Only use this if you can identify an actual result with real
    content — do not fabricate a summary from a thin/empty response.
 
-5. Only if all four sources above return nothing usable, write "Nessuna
-   informazione trovata in nessuna fonte — non verificato" for that item.
-   Do not fill the gap with your own knowledge under any circumstance.
+5. Only if all applicable sources above return nothing usable, write
+   "Nessuna informazione trovata in nessuna fonte — non verificato" for
+   that item. Do not fill the gap with your own knowledge under any
+   circumstance.
 
 For every successful lookup:
 - Paraphrase the finding in 2-4 sentences, in Italian, in your own words —

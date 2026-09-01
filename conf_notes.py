@@ -47,6 +47,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -192,6 +193,24 @@ def transcribe_with_gemini(audio: Path) -> str:
     # mismatch against the uploaded file's parent MIME type.
     mime_type = audio_file.mime_type
     logger.debug("Gemini upload: uri=%s mime_type=%s", audio_file.uri, mime_type)
+
+    # Uploaded files process asynchronously — referencing one before its
+    # state reaches ACTIVE is a documented cause of generic 400s. Poll
+    # until ready (or FAILED/timeout) before calling interactions.create.
+    poll_start = time.monotonic()
+    poll_timeout = 180
+    while not audio_file.state or audio_file.state.name == "PROCESSING":
+        if time.monotonic() - poll_start > poll_timeout:
+            raise RuntimeError(
+                f"Gemini file {audio_file.name} still PROCESSING after {poll_timeout}s"
+            )
+        logger.debug("  Gemini file %s state=%s, waiting...", audio_file.name, audio_file.state)
+        time.sleep(3)
+        audio_file = client.files.get(name=audio_file.name)
+
+    if audio_file.state.name != "ACTIVE":
+        raise RuntimeError(f"Gemini file {audio_file.name} failed to process: state={audio_file.state}")
+
     try:
         interaction = client.interactions.create(
             model="gemini-3.5-transcribe",

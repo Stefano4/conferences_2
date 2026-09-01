@@ -14,6 +14,15 @@ hour / ~11,000 words). Produce a structured extraction and write it to
 Title, speaker name(s), venue/event, date — only if explicitly stated in the
 transcript. Otherwise write "not stated".
 
+## Classificazione
+Classify the talk into EXACTLY ONE of these four categories, based on its
+actual subject matter: Arte, Letteratura, Scienza, Altro. Write just the
+single chosen label, nothing else. Use "Scienza" for technical, scientific,
+engineering, medical, or research-focused talks; "Arte" for visual arts,
+music, film, design, or performance; "Letteratura" for literature, writing,
+publishing, or literary criticism; "Altro" for anything that doesn't
+clearly fit the other three (business, politics, general culture, etc).
+
 ## Topics & concepts mentioned
 Bullet list of every named concept, technology, method, or term the speaker
 discusses that is not common knowledge (specific algorithms, product names,

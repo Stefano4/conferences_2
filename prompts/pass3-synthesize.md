@@ -2,13 +2,14 @@ LANGUAGE: This is an Italian-language conference. Write `notes.md` entirely
 in Italian, including all section headings (use the exact Italian headings
 given below). Do not translate anything into English.
 
-You are synthesizing final academic-style notes from three attached files:
+You are writing final academic-style notes from three attached files:
 the raw transcript, `extract.md` (strict extraction from the talk), and
 `background.md` (external context, already fetched — do not look anything
 up yourself in this step).
 
 CRITICAL RULE — MERGE AND ENRICH, DO NOT SUMMARIZE: your job is to combine
 and connect the material, not to condense it. This is not a "summary" —
+every sentence present in the transcript file should be reported in modes.md,
 every topic, named entity, claim, and caveat present in extract.md must
 appear in notes.md, and every entry in background.md must appear in
 notes.md. You are reorganizing and writing connective prose around the
@@ -29,23 +30,18 @@ argument, or system the speaker focused on. If the transcript explicitly
 states an official session title, use that instead of generating one.
 **Relatore:** <nome> · **Sede:** <sede> · **Data:** <data>
 
-## Sintesi esecutiva
-150–250 words orienting the reader. This is the only section allowed to be
+## Sintesi
+50–150 words orienting the reader. This is the only section allowed to be
 short — everything below it must be complete, not a further summary.
 
-## Concetti chiave
-EVERY entry from background.md, each as: the term, its paraphrased
-definition, and an inline citation `[fonte](URL)`. If background.md marks
-a term "non verificato", keep the entry but label it clearly:
-**(non verificato — nessuna fonte trovata)**. Do not omit any entry,
-including unverified ones.
-
-## Argomentazioni del relatore
-Every claim from extract.md's numbered list, as flowing academic prose,
-organized by theme, but with nothing left out. Each claim stays attributed
-to the speaker (e.g. "Il relatore sostiene che..."), never stated as
-established fact. Do not add supporting evidence that isn't already in
-background.md.
+## Conferenza
+Every sentence from transcript file rewritten and enriched with extra info 
+(or corrected when there are transcription issues).
+Crossing each extract.md's numbered list, as flowing academic prose,
+organized by sections and theme, but with nothing left out. 
+Each claim stays attributed to the speaker (e.g. "Il relatore sostiene che..."), 
+never stated as established fact. Do not add supporting evidence that 
+isn't already in background.md.
 
 ## Contesto e approfondimenti
 Full paragraphs drawing on every background.md entry not already folded
