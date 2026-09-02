@@ -178,25 +178,32 @@ def run_pi(
         )
 
 def transcribe_with_gemini(audio: Path) -> str:
-    """Transcribe audio via Gemini 3.5 Transcribe using the Gemini Files API."""
+    """Transcribe audio via Gemini 3.5 Transcribe."""
+
     if genai is None:
         raise RuntimeError(
             "google-genai not installed. Run: pip install google-genai"
         )
 
-    client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+    from google.genai import types
 
-    # 1. Upload audio file to Google's temporary storage
+    client = genai.Client()
+
+    # 1. Upload audio
     logger.debug("Uploading audio file %s to Gemini...", audio.name)
-    audio_file = client.files.upload(file=str(audio))
 
-    logger.debug(
-        "Gemini upload complete: uri=%s name=%s",
-        audio_file.uri,
-        audio_file.name,
+    audio_file = client.files.upload(
+        file=str(audio),
     )
 
-    # 2. Wait until the file is fully processed (ACTIVE)
+    logger.debug(
+        "Gemini upload complete: uri=%s name=%s mime=%s",
+        audio_file.uri,
+        audio_file.name,
+        audio_file.mime_type,
+    )
+
+    # 2. Wait for processing
     poll_start = time.monotonic()
     poll_timeout = 180
 
@@ -223,29 +230,21 @@ def transcribe_with_gemini(audio: Path) -> str:
         )
 
     try:
-        # 3. Request verbatim transcription
+        # 3. Transcribe using generate_content
         logger.debug("Sending transcription request to Gemini...")
 
-        interaction = client.interactions.create(
+        response = client.models.generate_content(
             model="gemini-3.5-transcribe",
-            input=[
-                {
-                    "type": "audio",
-                    "uri": audio_file.uri,
-                    "mime_type": audio_file.mime_type,
-                }
+            contents=[
+                "Transcribe this audio verbatim. Return only the transcription.",
+                types.Part.from_uri(
+                    file_uri=audio_file.uri,
+                    mime_type=audio_file.mime_type,
+                ),
             ],
-            generation_config={
-                "transcription_config": {
-                    "mode": {
-                        "type": "verbatim",
-                    }
-                }
-            },
         )
 
-        # 4. Extract the final transcription
-        text = (interaction.output_text or "").strip()
+        text = (response.text or "").strip()
 
         if not text:
             raise RuntimeError("Gemini returned an empty transcript")
@@ -253,7 +252,7 @@ def transcribe_with_gemini(audio: Path) -> str:
         return text
 
     finally:
-        # 5. Clean up uploaded file
+        # 4. Delete temporary uploaded file
         try:
             client.files.delete(name=audio_file.name)
         except Exception:
