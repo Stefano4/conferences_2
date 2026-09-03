@@ -58,6 +58,16 @@ from pathlib import Path
 # WeasyPrint in particular can fail with OSError (not ImportError) when it
 # can't dlopen its native libraries (pango/cairo/gdk-pixbuf) — see
 # check_environment() below for the macOS fix.
+# Pin the HuggingFace cache to a fixed folder next to the script *before*
+# mlx_whisper/huggingface_hub are imported. Without this, the cache
+# location depends on $HOME at the time of the call — if this script is
+# ever run from cron/launchd/a different shell with a different (or
+# unset) $HOME, huggingface_hub resolves to a different cache dir and it
+# looks like the model gets re-downloaded every day even though nothing
+# is actually wrong with the download itself.
+SCRIPT_DIR = Path(__file__).resolve().parent
+os.environ.setdefault("HF_HOME", str(SCRIPT_DIR / ".hf-cache"))
+
 try:
     import mlx_whisper
 except ImportError:
@@ -82,7 +92,6 @@ except ImportError:
     markdown = None
 # -----------------------------------------------------------------------
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 WORK_DIR = SCRIPT_DIR / "work"  # scratch space for intermediate files per run
 
@@ -164,17 +173,40 @@ def run_pi(
     cmd += ["--tools", tools]
     if model:
         cmd += ["--model", model]
+    # Extra flags for pi itself (e.g. a verbosity/debug flag so it prints
+    # which provider/model in provider-fallback.json actually served each
+    # request). Flag name varies by pi version/config, so it's left as an
+    # opt-in env var rather than hardcoded — check `pi --help` for yours,
+    # e.g.: export PI_EXTRA_ARGS="--log-level debug"
+    cmd += os.environ.get("PI_EXTRA_ARGS", "").split()
 
-    logger.debug("Running (cwd=%s): pi -p %s ... --tools %s%s",
-                  cwd, " ".join(f"@{p.name}" for p in attachments),
-                  tools, f" --model {model}" if model else "")
+    logger.info("Running pi (cwd=%s): pi -p %s ... --tools %s%s",
+                cwd, " ".join(f"@{p.name}" for p in attachments),
+                tools, f" --model {model}" if model else "")
+
+    # Stream instead of subprocess.run(): the old version piped stdout
+    # straight into logfile with a raw open(), bypassing the logging
+    # module entirely — so those per-pass log files had no timestamps,
+    # and pi's real-time activity (tool calls, retries, which provider
+    # actually answered) was invisible until the whole call finished.
+    # Streaming line-by-line lets us timestamp every row AND mirror it
+    # into the main run log so it's visible live with -v.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=cwd, text=True, bufsize=1,
+    )
 
     with open(logfile, "w") as lf:
-        result = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=cwd)
+        for line in proc.stdout:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lf.write(f"{ts} {line}")
+            lf.flush()
+            logger.debug("[pi] %s", line.rstrip())
 
-    if result.returncode != 0:
+    returncode = proc.wait()
+    if returncode != 0:
         raise RuntimeError(
-            f"pi call failed (exit {result.returncode}). See {logfile} for details."
+            f"pi call failed (exit {returncode}). See {logfile} for details."
         )
 
 def transcribe_with_gemini(audio: Path) -> str:
@@ -262,9 +294,29 @@ def transcribe_with_gemini(audio: Path) -> str:
             )
 
 
+def _whisper_model_is_cached(whisper_model: str) -> bool:
+    """Best-effort check of whether whisper_model is already in the local
+    HF cache, purely so the log can say which one happened (helps confirm
+    the caching fix is actually working, instead of guessing from timing)."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        cached_repos = {repo.repo_id for repo in scan_cache_dir().repos}
+        return whisper_model in cached_repos
+    except Exception:
+        return False  # can't tell -> don't claim either way in the log
+
+
 def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
     if mlx_whisper is None:
         raise RuntimeError("mlx-whisper not installed. Run: pip install mlx-whisper")
+
+    if _whisper_model_is_cached(whisper_model):
+        logger.debug("  Whisper model %s found in cache (%s) — no download needed",
+                      whisper_model, os.environ.get("HF_HOME"))
+    else:
+        logger.info("  Whisper model %s not in cache (%s) — downloading once, "
+                     "will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
+
     result = mlx_whisper.transcribe(str(audio), path_or_hf_repo=whisper_model)
     return result["text"].strip()
 
