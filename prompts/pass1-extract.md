@@ -33,9 +33,26 @@ spoken — no explanation.
 People, organizations, papers, products mentioned by name.
 
 ## Speaker's claims & arguments
-Numbered list of paragraphs. Rewrite, sentence by sentence, the speaker speech.
-Do not skip any sentence, unless there are clear repetitions.
-Use the closest verbatim phrase from the transcript it's based on. 
+This section is a full rewrite of the talk, not a selection from it. Later
+steps in this pipeline will work from this section as their only record of
+what was said — they will not have the transcript itself — so it must carry
+the same information as the transcript, simply rewritten: cleaned up,
+reorganized into numbered paragraphs, but not filtered down.
+
+Numbered list of paragraphs, grouped the way the speaker naturally grouped
+their own points. Within each paragraph, rewrite the speaker's speech
+sentence by sentence, in order, covering essentially every sentence in the
+transcript — treat "I skipped a sentence because it seemed minor/off-topic/
+already implied" as not a valid reason to skip it. The only sentences that
+may be left out are exact or near-exact repeats of a sentence already
+captured (the speaker restating the same point in the same words) and pure
+disfluency with zero informational content (e.g. a lone "ehm", a false
+start abandoned mid-word before the real sentence begins). Everything else
+— including asides, digressions, jokes, anecdotes, audience interaction,
+transitions like "detto questo" or "quindi", and material that seems
+redundant but is phrased differently or adds any nuance — gets its own
+place in the list.
+Use the closest verbatim phrase from the transcript it's based on.
 
 - Never write "..." anywhere in this section, for any reason. "..." is
   always a sign that content is being dropped, and content must never be
@@ -46,15 +63,23 @@ Use the closest verbatim phrase from the transcript it's based on.
 - Do not soften, generalize, summarize, or add nuance the speaker didn't
   state. This is a transcription-level extraction, not a summary — the
   test is "could someone reconstruct what was actually said from this
-  list", not "did I capture the gist". 
-- Before finishing this section, reread your own draft specifically to find 
-  any "..." or any place where you can tell you left out some statement 
-  rather than transcribe. If you find one, go back to the transcript and 
-  expand it into full sentence(s) instead, just compressing repetitions.
+  list, sentence for sentence", not "did I capture the gist".
+- Do not merge two distinct sentences into one to save space, even if they
+  are closely related — give each its own entry (or its own clause within
+  a paragraph) so no individual statement is absorbed into another.
+- Before finishing this section, go back to the transcript and check it
+  against your draft passage by passage (not just skimming for "...").
+  For each stretch of transcript, confirm there is a corresponding item in
+  your list. If you find a gap — a sentence, aside, or point with no
+  counterpart in the draft — add it before moving on. A shorter list is
+  not a sign you did a better job; a list that is missing something the
+  speaker said is a failure of this pass.
 
 If this makes the section very long, that is correct and expected — do not
 shorten it to keep the file a manageable size. Length is not a concern in
-this pass.
+this pass. Given the transcript is roughly one hour / ~11,000 words, this
+section rewriting essentially all of it should itself run to several
+thousand words — a short version means content is missing.
 
 ## Explicit open questions / caveats
 Anything the speaker themselves flagged as uncertain, contested, or

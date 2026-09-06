@@ -5,11 +5,20 @@ one at a time, turns each into a transcript PDF, a notes markdown file, and
 a notes PDF (3 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API
-key needed). That transcript feeds a 4-pass pi pipeline:
-  1. extract     — pull claims/topics/quotes from the transcript only
+key needed). The raw transcript is first lightly cleaned up by pi, then
+that cleaned transcript feeds a 4-pass pi pipeline:
+  0. cleanup      — de-dupe/de-hallucinate raw whisper output, drop filler
+                    ("grazie grazie"-style repeats), fix obvious typos —
+                    no content removed, nothing paraphrased
+  1. extract     — pull claims/topics/quotes from the cleaned transcript only
   2. enrich       — look up each topic across free, no-key sources
   3. synthesize   — combine into full academic notes, nothing dropped
   4. verify       — flag (never delete) anything not traceable to a source
+
+Only pass 1 (extract) and pass 0 (cleanup) ever see the transcript text
+itself — passes 2-4 work from extract.md/background.md/notes.md, which
+already contain everything they need, so the (much longer) transcript
+isn't re-sent to pi on every later pass.
 
 Folder layout (created automatically next to the script if missing):
   input/   — drop recordings here; processed files are moved to
@@ -94,17 +103,25 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 LOG_DIR = SCRIPT_DIR / "logs"
 # ---------------------------------------------------------------------------
 
-STAGES = ["transcribe", "extract", "enrich", "synthesize", "verify", "pdf"]
+STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", "pdf"]
 WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
+#
+# Note: only "cleanup" and "extract" need the (raw/cleaned) transcript text.
+# From "synthesize" onward, extract.md's "Speaker's claims & arguments"
+# section is already a compressed-but-complete sentence-by-sentence record
+# of the talk, so the full transcript is not re-attached to later pi calls
+# (it's long, and re-sending it on every pass just burns tokens for no
+# extra information pi doesn't already have via extract.md).
 STAGE_REQUIRES = {
+    "cleanup": ["transcript-raw.txt"],
     "extract": ["transcript.txt"],
     "enrich": ["extract.md"],
-    "synthesize": ["transcript.txt", "extract.md", "background.md"],
-    "verify": ["notes.md", "transcript.txt", "background.md"],
+    "synthesize": ["extract.md", "background.md"],
+    "verify": ["notes.md", "extract.md", "background.md"],
     "pdf": ["notes.md", "transcript.txt"],
 }
 
@@ -292,16 +309,35 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
 
 
 def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
-    logger.info("[1/6] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
+    logger.info("[1/7] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
     text = transcribe_with_local_whisper(audio, whisper_model)
 
-    out = workdir / "transcript.txt"
+    out = workdir / "transcript-raw.txt"
     out.write_text(text)
     logger.info("  wrote %s (%d words)", out, len(text.split()))
 
 
+def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
+    """Light pi pass over the raw whisper output: drop duplicated/hallucinated
+    lines and repeated filler ("grazie grazie", "buongiorno buongiorno", ...)
+    and fix obvious mis-transcription typos — nothing summarized, nothing
+    reworded, no content removed. Writes the transcript.txt that every later
+    stage (extract, and the final transcript PDF) actually consumes."""
+    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped)")
+    run_pi(
+        attachments=[workdir / "transcript-raw.txt"],
+        prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
+        tools="read,write",
+        model=model_fast,
+        logfile=workdir / "pass0.log",
+        cwd=workdir,
+    )
+    _require(workdir / "transcript.txt", "Pass 0")
+    logger.info("  wrote %s", workdir / "transcript.txt")
+
+
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
-    logger.info("[2/6] Pass 1: extraction (transcript-only, no outside knowledge)")
+    logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
     run_pi(
         attachments=[workdir / "transcript.txt"],
         prompt_file=PROMPTS_DIR / "pass1-extract.md",
@@ -315,7 +351,7 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
-    logger.info("[3/6] Pass 2: multi-source enrichment (no API keys)")
+    logger.info("[4/7] Pass 2: multi-source enrichment (no API keys)")
     run_pi(
         attachments=[workdir / "extract.md"],
         prompt_file=PROMPTS_DIR / "pass2-enrich.md",
@@ -329,11 +365,15 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
-    logger.info("[4/6] Pass 3: synthesis into full academic notes (no info dropped)")
+    logger.info("[5/7] Pass 3: synthesis into full academic notes (no info dropped)")
     logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of pi)", date_str)
+    # Deliberately NOT attaching transcript.txt here: extract.md's "Speaker's
+    # claims & arguments" section already is a compressed-but-complete,
+    # sentence-by-sentence record of the talk (see pass1-extract.md's
+    # no-ellipsis rule), so re-sending the full transcript on top of it would
+    # just burn tokens for content pi already has.
     run_pi(
         attachments=[
-            workdir / "transcript.txt",
             workdir / "extract.md",
             workdir / "background.md",
         ],
@@ -349,11 +389,14 @@ def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> 
 
 
 def stage_verify(workdir: Path, model_strong: str | None) -> None:
-    logger.info("[5/6] Pass 4: verification (flags unsupported claims, deletes nothing)")
+    logger.info("[6/7] Pass 4: verification (flags unsupported claims, deletes nothing)")
+    # extract.md (not transcript.txt) is the ground truth pass4-verify.md
+    # actually checks the speaker's-view sentences against, so it's attached
+    # here instead of the full transcript.
     run_pi(
         attachments=[
             workdir / "notes.md",
-            workdir / "transcript.txt",
+            workdir / "extract.md",
             workdir / "background.md",
         ],
         prompt_file=PROMPTS_DIR / "pass4-verify.md",
@@ -555,7 +598,7 @@ def _render_pdf(html_body: str, dest: Path) -> None:
 
 
 def stage_pdf(workdir: Path, run_name: str) -> None:
-    logger.info("[6/6] Rendering PDFs (WeasyPrint)")
+    logger.info("[7/7] Rendering PDFs (WeasyPrint)")
 
     notes_md = (workdir / "notes.md").read_text()
     _render_pdf(_markdown_to_html(notes_md), workdir / "notes.pdf")
@@ -613,6 +656,8 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
 
     if start <= STAGES.index("transcribe"):
         stage_transcribe(audio, workdir, args.whisper_model)
+    if start <= STAGES.index("cleanup"):
+        stage_cleanup(workdir, args.model_fast)
     if start <= STAGES.index("extract"):
         stage_extract(workdir, args.model_fast)
     if start <= STAGES.index("enrich"):
