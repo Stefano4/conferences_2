@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 conf_notes.py — batch pipeline: scans an input folder for recordings and,
-one at a time, turns each into a transcript PDF, a notes markdown file, and
-a notes PDF (3 files per recording).
+one at a time, turns each into a transcript PDF, a notes markdown file, a
+notes HTML file, and a notes PDF (4 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API
 key needed). The raw transcript is first lightly cleaned up by pi, then
@@ -23,8 +23,9 @@ isn't re-sent to pi on every later pass.
 Folder layout (created automatically next to the script if missing):
   input/   — drop recordings here; processed files are moved to
              input/processed/ so reruns don't redo them
-  output/  — final "<name>-notes.md", "<name>-notes.pdf", and
-             "<name>-transcript.pdf" land here (3 files per recording)
+  output/  — final "<name>-notes.md", "<name>-notes.html",
+             "<name>-notes.pdf", and "<name>-transcript.pdf" land here
+             (4 files per recording)
   logs/    — one log file per run, named yyyy-MM-dd_hh-mm_<name>.log
 
 Requirements:
@@ -597,24 +598,38 @@ def _render_pdf(html_body: str, dest: Path) -> None:
     logger.info("  wrote %s", dest)
 
 
+def _render_html(html_body: str, dest: Path) -> None:
+    """Write a standalone, self-contained HTML file (same CSS/layout as the
+    PDF, just without WeasyPrint's page-specific @page rules mattering)."""
+    css = PDF_CSS.format(margin=PDF_MARGIN, font_size=PDF_FONT_SIZE, font_family=PDF_FONT_FAMILY)
+    full_html = HTML_TEMPLATE.format(css=css, body=html_body)
+    dest.write_text(full_html, encoding="utf-8")
+    logger.info("  wrote %s", dest)
+
+
 def stage_pdf(workdir: Path, run_name: str) -> None:
-    logger.info("[7/7] Rendering PDFs (WeasyPrint)")
+    logger.info("[7/7] Rendering PDF/HTML outputs (WeasyPrint)")
 
     notes_md = (workdir / "notes.md").read_text()
-    _render_pdf(_markdown_to_html(notes_md), workdir / "notes.pdf")
+    notes_html_body = _markdown_to_html(notes_md)
+    _render_pdf(notes_html_body, workdir / "notes.pdf")
+    _render_html(notes_html_body, workdir / "notes.html")
 
     transcript_text = (workdir / "transcript.txt").read_text()
     _render_pdf(_text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf")
 
     notes_md_dest = OUTPUT_DIR / f"{run_name}-notes.md"
     notes_pdf_dest = OUTPUT_DIR / f"{run_name}-notes.pdf"
+    notes_html_dest = OUTPUT_DIR / f"{run_name}-notes.html"
     transcript_pdf_dest = OUTPUT_DIR / f"{run_name}-transcript.pdf"
     shutil.copy2(workdir / "notes.md", notes_md_dest)
     shutil.copy2(workdir / "notes.pdf", notes_pdf_dest)
+    shutil.copy2(workdir / "notes.html", notes_html_dest)
     shutil.copy2(workdir / "transcript.pdf", transcript_pdf_dest)
-    logger.info("  copied 3 output files to %s", OUTPUT_DIR)
+    logger.info("  copied 4 output files to %s", OUTPUT_DIR)
     logger.info("    %s", notes_md_dest)
     logger.info("    %s", notes_pdf_dest)
+    logger.info("    %s", notes_html_dest)
     logger.info("    %s", transcript_pdf_dest)
 
 
@@ -684,7 +699,7 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
             logger.debug("Not moving %s to processed/ (outside INPUT_DIR)", audio)
 
     logger.info("Done with %s.", audio.name)
-    logger.info("  3 output files in: %s", OUTPUT_DIR)
+    logger.info("  4 output files in: %s", OUTPUT_DIR)
     logger.info("  Intermediate files kept in: %s", workdir)
 
 
