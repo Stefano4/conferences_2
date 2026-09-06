@@ -4,10 +4,8 @@ conf_notes.py — batch pipeline: scans an input folder for recordings and,
 one at a time, turns each into a transcript PDF, a notes markdown file, and
 a notes PDF (3 files per recording).
 
-Transcription tries Gemini 3.5 Transcribe (cloud) first if a GEMINI_API_KEY
-/ GOOGLE_API_KEY is set, and falls back to local mlx-whisper on any failure
-(no key, network issue, rate limit, file too long, etc). That transcript
-feeds a 4-pass pi pipeline:
+Transcription is done locally with mlx-whisper (no cloud calls, no API
+key needed). That transcript feeds a 4-pass pi pipeline:
   1. extract     — pull claims/topics/quotes from the transcript only
   2. enrich       — look up each topic across free, no-key sources
   3. synthesize   — combine into full academic notes, nothing dropped
@@ -21,10 +19,9 @@ Folder layout (created automatically next to the script if missing):
   logs/    — one log file per run, named yyyy-MM-dd_hh-mm_<name>.log
 
 Requirements:
-    pip install mlx-whisper google-genai weasyprint markdown
+    pip install mlx-whisper weasyprint markdown
     brew install cairo pango gdk-pixbuf libffi ffmpeg   # WeasyPrint + mlx-whisper native deps
     pi CLI already installed and configured with your provider fallbacks
-    export GEMINI_API_KEY=...           # optional: enables cloud transcription
 
 macOS note: if WeasyPrint fails to import with a library-loading error,
 Homebrew's libs usually just aren't on the dynamic linker's search path —
@@ -37,8 +34,8 @@ Usage:
     python conf_notes.py -v                   # debug-level console logging
 """
 
-from __future__ import annotations
 
+from __future__ import annotations
 import argparse
 import html
 import logging
@@ -47,14 +44,12 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
 # --- Optional third-party imports, resolved once at startup ----------------
 # Kept optional (not a hard `import` at call time) so a missing backend
-# degrades gracefully instead of crashing the whole script — e.g. Gemini
-# should still work if mlx-whisper isn't installed, and vice versa.
+# degrades gracefully instead of crashing the whole script.
 # WeasyPrint in particular can fail with OSError (not ImportError) when it
 # can't dlopen its native libraries (pango/cairo/gdk-pixbuf) — see
 # check_environment() below for the macOS fix.
@@ -72,11 +67,6 @@ try:
     import mlx_whisper
 except ImportError:
     mlx_whisper = None
-
-try:
-    from google import genai
-except ImportError:
-    genai = None
 
 try:
     import weasyprint
@@ -118,6 +108,62 @@ STAGE_REQUIRES = {
     "pdf": ["notes.md", "transcript.txt"],
 }
 
+_ITALIAN_MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+                    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+
+# Date patterns to look for in a recording's filename, tried in order.
+# Each tuple is (regex, group order). Deliberately conservative (requires
+# 4-digit years, non-digit boundaries) to avoid false positives on
+# filenames that just happen to contain other numbers.
+_DATE_PATTERNS = [
+    (re.compile(r"(?<!\d)(\d{4})[-_.](\d{2})[-_.](\d{2})(?!\d)"), "ymd"),
+    (re.compile(r"(?<!\d)(\d{2})[-_.](\d{2})[-_.](\d{4})(?!\d)"), "dmy"),
+    (re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)"), "ymd"),
+]
+
+
+def _format_italian_date(y: int, m: int, d: int) -> str | None:
+    if 1 <= m <= 12 and 1 <= d <= 31 and 2000 <= y <= 2100:
+        return f"{d} {_ITALIAN_MONTHS[m - 1]} {y}"
+    return None
+
+
+def derive_date_from_filename(audio: Path) -> str:
+    """Best-effort 'Data' value for notes.md's header.
+
+    The speaker rarely states the date out loud in a conference talk, so
+    asking pi to find it in the transcript fails most of the time (see
+    extract.md's Session metadata section usually saying "not stated").
+    We derive it ourselves instead and hand it to pi as a fixed value to
+    drop in, rather than a lookup task for it to attempt and get wrong.
+
+    Tries common date patterns in the filename first (most reliable,
+    since recordings are typically named by whoever made them, e.g.
+    "2026-03-05_convegno.m4a"), then falls back to the file's
+    last-modified time, clearly labelled as such since it's a weaker
+    signal (could be a copy/export date rather than the talk's date).
+    """
+    name = audio.stem
+    for pattern, order in _DATE_PATTERNS:
+        m = pattern.search(name)
+        if not m:
+            continue
+        y, mo, d = (m.group(1), m.group(2), m.group(3)) if order == "ymd" else (m.group(3), m.group(2), m.group(1))
+        formatted = _format_italian_date(int(y), int(mo), int(d))
+        if formatted:
+            return formatted
+
+    try:
+        mtime = datetime.fromtimestamp(audio.stat().st_mtime)
+        formatted = _format_italian_date(mtime.year, mtime.month, mtime.day)
+        if formatted:
+            return f"{formatted} (dedotta dalla data del file, non dal nome file)"
+    except OSError:
+        pass
+
+    return "non determinata"
+
+
 logger = logging.getLogger("conf_notes")
 
 
@@ -155,6 +201,7 @@ def run_pi(
     model: str | None,
     logfile: Path,
     cwd: Path,
+    substitutions: dict[str, str] | None = None,
 ) -> None:
     """Invoke pi non-interactively: pi -p @file1 @file2 "<prompt>" --tools ...
 
@@ -167,6 +214,13 @@ def run_pi(
     its output in the wrong place.
     """
     prompt_text = prompt_file.read_text()
+    # Fill in any values the script already knows (e.g. the talk's date,
+    # derived from the filename) instead of leaving pi to infer them from
+    # the transcript, which is unreliable for things speakers rarely
+    # state out loud.
+    for key, value in (substitutions or {}).items():
+        prompt_text = prompt_text.replace(key, value)
+
     cmd = ["pi", "-p"]
     cmd += [f"@{p}" for p in attachments]
     cmd += [prompt_text]
@@ -209,90 +263,6 @@ def run_pi(
             f"pi call failed (exit {returncode}). See {logfile} for details."
         )
 
-def transcribe_with_gemini(audio: Path) -> str:
-    """Transcribe audio via Gemini 3.5 Transcribe."""
-
-    if genai is None:
-        raise RuntimeError(
-            "google-genai not installed. Run: pip install google-genai"
-        )
-
-    from google.genai import types
-
-    client = genai.Client()
-
-    # 1. Upload audio
-    logger.debug("Uploading audio file %s to Gemini...", audio.name)
-
-    audio_file = client.files.upload(
-        file=str(audio),
-    )
-
-    logger.debug(
-        "Gemini upload complete: uri=%s name=%s mime=%s",
-        audio_file.uri,
-        audio_file.name,
-        audio_file.mime_type,
-    )
-
-    # 2. Wait for processing
-    poll_start = time.monotonic()
-    poll_timeout = 180
-
-    while audio_file.state and audio_file.state.name == "PROCESSING":
-        if time.monotonic() - poll_start > poll_timeout:
-            raise RuntimeError(
-                f"Gemini file {audio_file.name} still PROCESSING "
-                f"after {poll_timeout}s"
-            )
-
-        logger.debug(
-            "  Gemini file %s state=%s, waiting...",
-            audio_file.name,
-            audio_file.state.name,
-        )
-
-        time.sleep(3)
-        audio_file = client.files.get(name=audio_file.name)
-
-    if audio_file.state.name != "ACTIVE":
-        raise RuntimeError(
-            f"Gemini file {audio_file.name} failed to process: "
-            f"state={audio_file.state.name}"
-        )
-
-    try:
-        # 3. Transcribe using generate_content
-        logger.debug("Sending transcription request to Gemini...")
-
-        response = client.models.generate_content(
-            model="gemini-3.5-transcribe",
-            contents=[
-                "Transcribe this audio verbatim. Return only the transcription.",
-                types.Part.from_uri(
-                    file_uri=audio_file.uri,
-                    mime_type=audio_file.mime_type,
-                ),
-            ],
-        )
-
-        text = (response.text or "").strip()
-
-        if not text:
-            raise RuntimeError("Gemini returned an empty transcript")
-
-        return text
-
-    finally:
-        # 4. Delete temporary uploaded file
-        try:
-            client.files.delete(name=audio_file.name)
-        except Exception:
-            logger.debug(
-                "Could not delete uploaded Gemini file %s (non-fatal)",
-                audio_file.name,
-            )
-
 
 def _whisper_model_is_cached(whisper_model: str) -> bool:
     """Best-effort check of whether whisper_model is already in the local
@@ -322,24 +292,8 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
 
 
 def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
-    logger.info("[1/6] Transcribing audio")
-    text = None
-    has_key = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-
-    if has_key:
-        logger.info("  trying Gemini 3.5 Transcribe (cloud)")
-        try:
-            text = transcribe_with_gemini(audio)
-            logger.info("  Gemini transcription succeeded")
-        except Exception as e:
-            logger.warning("  Gemini transcription failed: %s: %s — falling back to local Whisper",
-                           type(e).__name__, e)
-    else:
-        logger.info("  no GEMINI_API_KEY/GOOGLE_API_KEY set — using local Whisper")
-
-    if text is None:
-        logger.info("  transcribing locally (mlx-whisper, model=%s)", whisper_model)
-        text = transcribe_with_local_whisper(audio, whisper_model)
+    logger.info("[1/6] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
+    text = transcribe_with_local_whisper(audio, whisper_model)
 
     out = workdir / "transcript.txt"
     out.write_text(text)
@@ -374,8 +328,9 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     logger.info("  wrote %s", workdir / "background.md")
 
 
-def stage_synthesize(workdir: Path, model_strong: str | None) -> None:
+def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
     logger.info("[4/6] Pass 3: synthesis into full academic notes (no info dropped)")
+    logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of pi)", date_str)
     run_pi(
         attachments=[
             workdir / "transcript.txt",
@@ -387,6 +342,7 @@ def stage_synthesize(workdir: Path, model_strong: str | None) -> None:
         model=model_strong,
         logfile=workdir / "pass3.log",
         cwd=workdir,
+        substitutions={"{{DATA}}": date_str},
     )
     _require(workdir / "notes.md", "Pass 3")
     logger.info("  wrote %s", workdir / "notes.md")
@@ -662,7 +618,7 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
     if start <= STAGES.index("enrich"):
         stage_enrich(workdir, args.model_fast)
     if start <= STAGES.index("synthesize"):
-        stage_synthesize(workdir, args.model_strong)
+        stage_synthesize(workdir, args.model_strong, derive_date_from_filename(audio))
     if start <= STAGES.index("verify"):
         stage_verify(workdir, args.model_strong)
     if start <= STAGES.index("pdf"):
@@ -712,17 +668,15 @@ def check_environment() -> None:
         )
     if markdown is None:
         problems.append("`markdown` not installed — required to render notes.md. Run: pip install markdown")
-    if mlx_whisper is not None and shutil.which("ffmpeg") is None:
+    if mlx_whisper is None:
         problems.append(
-            "`ffmpeg` not found on PATH — mlx-whisper needs it to decode audio "
-            "(used as the local fallback if Gemini fails/is unavailable). Run: brew install ffmpeg"
+            "mlx-whisper isn't installed — it's the only transcription "
+            "backend now. Run: pip install mlx-whisper"
         )
-
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")) and mlx_whisper is None:
+    elif shutil.which("ffmpeg") is None:
         problems.append(
-            "No transcription backend available: no GEMINI_API_KEY/GOOGLE_API_KEY "
-            "set, and mlx-whisper isn't installed. Set one of the env vars, or "
-            "run: pip install mlx-whisper"
+            "`ffmpeg` not found on PATH — mlx-whisper needs it to decode audio. "
+            "Run: brew install ffmpeg"
         )
 
     if problems:

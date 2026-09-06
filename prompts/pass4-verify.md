@@ -1,7 +1,7 @@
 LANGUAGE: `notes.md` is written in Italian. Keep all your edits and
 annotations in Italian too.
 
-You are fact-checking `notes.md` against `transcript.txt` (ground truth for
+You are fact-checking `notes.md` against `extract.md` (ground truth for
 what the speaker said) and `background.md` (ground truth for external
 facts). You do NOT have web access in this step, and you must not use it —
 only compare the three attached files against each other.
@@ -12,19 +12,29 @@ unsupported — flag it instead. All information stays in the document.
 
 For every factual sentence in notes.md, check:
 - If it's presented as the speaker's view: does it match something
-  actually in transcript.txt?
+  actually in extract.md?
 - If it's presented as background/context: is it backed by an entry in
   background.md?
 - If neither applies: it is UNSUPPORTED.
 
+ADDITIONAL CHECK — TRUNCATION: separately scan notes.md for any "..." or
+any place a sentence looks cut short / paraphrased down from something
+longer. For each one you find:
+- Do not silently fix it yourself with outside knowledge.
+- Look up the corresponding moment in extract.md and, if you can find
+  the full original passage, replace the truncated text with the complete
+  wording (this is filling a real gap from the ground-truth source, not
+  adding new content, so it's allowed here).
+
 Rewrite `notes.md` in place:
 - Leave supported sentences exactly as they are.
 - For unsupported sentences, keep the sentence but append inline:
-  "**[non verificato — non riscontrabile nella trascrizione o nelle fonti
-  di supporto]**". Do not delete or shorten it.
+  "**[non verificato]**". Do not delete or shorten it.
 - Add a final `## Note di verifica` section listing every sentence you
-  flagged and a one-line reason, so the reader can see exactly what wasn't
-  traceable to a source.
+  flagged (both unsupported and truncated) and a one-line reason, so the
+  reader can see exactly what wasn't traceable to a source or was
+  recovered/left incomplete.
 
-Do not add any new facts while doing this pass, and do not remove any
-existing content — only annotate.
+Do not add any new facts while doing this pass beyond recovering
+truncated passages from extract.md as described above, and do not
+remove any existing content — only annotate.
