@@ -117,7 +117,7 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 # never leaves the machine and doesn't spend cloud-model budget on a pass
 # that doesn't need a strong model. See stage_cleanup() below, which passes
 # this constant to pi regardless of what --model-fast is set to.
-CLEANUP_MODEL = "gemma4:e4b-mlx"
+CLEANUP_MODEL = "gemini-flash-lite-latest" #"gemma4:e4b-mlx"
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
