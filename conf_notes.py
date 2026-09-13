@@ -5,11 +5,14 @@ one at a time, turns each into a transcript PDF, a notes markdown file, a
 notes HTML file, and a notes PDF (4 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API
-key needed). The raw transcript is first lightly cleaned up by pi, then
-that cleaned transcript feeds a 4-pass pi pipeline:
+key needed). The raw transcript is first lightly cleaned up by pi (also
+forced to run on a local model — see CLEANUP_MODEL below — so this pass
+stays fully offline too), then that cleaned transcript feeds a 4-pass pi
+pipeline:
   0. cleanup      — de-dupe/de-hallucinate raw whisper output, drop filler
                     ("grazie grazie"-style repeats), fix obvious typos —
-                    no content removed, nothing paraphrased
+                    no content removed, nothing paraphrased. Runs on
+                    CLEANUP_MODEL (local, via ollama), not --model-fast.
   1. extract     — pull claims/topics/quotes from the cleaned transcript only
   2. enrich       — look up each topic across free, no-key sources
   3. synthesize   — combine into full academic notes, nothing dropped
@@ -107,6 +110,14 @@ LOG_DIR = SCRIPT_DIR / "logs"
 STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", "pdf"]
 WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
+
+# Pass 0 (cleanup) is light, mechanical work (de-dupe/de-hallucinate/typo-fix
+# on the raw whisper output, no real reasoning about content) so it's forced
+# to run on a local ollama model instead of --model-fast/PI_MODEL_FAST — it
+# never leaves the machine and doesn't spend cloud-model budget on a pass
+# that doesn't need a strong model. See stage_cleanup() below, which passes
+# this constant to pi regardless of what --model-fast is set to.
+CLEANUP_MODEL = "gemma4:e4b-mlx"
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
@@ -211,6 +222,57 @@ def discover_audio_files(input_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.name)
 
 
+# Pi's `read` tool truncates (silently, per line) at roughly this many bytes
+# — see run_pi()'s docstring. Kept as its own constant (not folded into
+# run_pi) since it's a property of pi's read tool, not of how we invoke pi.
+PI_READ_LINE_LIMIT_BYTES = 50_000
+
+
+def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) -> None:
+    """Safety net: insert line breaks at whitespace so no single line in
+    `path` exceeds max_bytes, without changing any word or character in the
+    file — only where the newlines fall.
+
+    Why this exists in addition to transcribe_with_local_whisper() writing
+    transcript-raw.txt pre-split into short lines: that only guarantees the
+    *first* file pi reads is safe. Every later stage's output is written by
+    pi itself (following prompt instructions like "keep line breaks as in
+    the original"), and a model — especially a small local one — isn't
+    guaranteed to honor that. If e.g. pass 0's cleanup model flattens
+    transcript.txt back into one long paragraph while "cleaning" it, pass 1
+    would silently see only a truncated prefix of the talk, with no error
+    raised anywhere. Called on every stage's output file right after
+    _require() confirms it exists, so this holds regardless of what the
+    model actually did with formatting.
+    """
+    text = path.read_text()
+    lines = text.split("\n")
+    if all(len(line.encode("utf-8")) <= max_bytes for line in lines):
+        return  # already safe — nothing to rewrite
+
+    out_lines = []
+    for line in lines:
+        if len(line.encode("utf-8")) <= max_bytes:
+            out_lines.append(line)
+            continue
+        # Break only at existing spaces, never mid-word, so this can't
+        # alter or split any actual word/character in the transcript.
+        current = ""
+        for word in line.split(" "):
+            candidate = f"{current} {word}" if current else word
+            if current and len(candidate.encode("utf-8")) > max_bytes:
+                out_lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            out_lines.append(current)
+
+    path.write_text("\n".join(out_lines))
+    logger.debug("  rewrapped long line(s) in %s to stay under pi's ~%dKB read limit",
+                 path.name, max_bytes // 1000)
+
+
 def run_pi(
     *,
     attachments: list[Path],
@@ -306,6 +368,22 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
                      "will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
 
     result = mlx_whisper.transcribe(str(audio), path_or_hf_repo=whisper_model)
+
+    # Join whisper's own per-phrase segments with newlines instead of using
+    # result["text"] (one giant single-line string for the whole recording).
+    # A ~1-hour talk produces a ~50-60KB single line, which blows past pi's
+    # per-line read limit (50KB) and silently truncates whatever pass reads
+    # this file first (pass 0 cleanup) to just the opening minutes — with no
+    # error, just a quiet content-loss bug downstream. Segment boundaries are
+    # whisper's own phrase breaks, not a rewording, so this changes nothing
+    # about the transcribed words, only how they're laid out on disk.
+    segments = result.get("segments") or []
+    if segments:
+        lines = [seg.get("text", "").strip() for seg in segments]
+        lines = [line for line in lines if line]
+        return "\n".join(lines)
+
+    # Fallback if a whisper backend/version ever omits segments.
     return result["text"].strip()
 
 
@@ -315,6 +393,7 @@ def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
 
     out = workdir / "transcript-raw.txt"
     out.write_text(text)
+    ensure_no_long_lines(out)  # belt-and-suspenders alongside the segment-based split above
     logger.info("  wrote %s (%d words)", out, len(text.split()))
 
 
@@ -323,13 +402,19 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     lines and repeated filler ("grazie grazie", "buongiorno buongiorno", ...)
     and fix obvious mis-transcription typos — nothing summarized, nothing
     reworded, no content removed. Writes the transcript.txt that every later
-    stage (extract, and the final transcript PDF) actually consumes."""
-    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped)")
+    stage (extract, and the final transcript PDF) actually consumes.
+
+    model_fast is accepted (and still used by every other stage) but
+    deliberately ignored here: cleanup is forced onto the local CLEANUP_MODEL
+    instead, since this pass is mechanical enough not to need a cloud model
+    and runs fully offline via ollama."""
+    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)",
+                CLEANUP_MODEL)
     run_pi(
         attachments=[workdir / "transcript-raw.txt"],
         prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
         tools="read,write",
-        model=model_fast,
+        model=CLEANUP_MODEL,
         logfile=workdir / "pass0.log",
         cwd=workdir,
     )
@@ -406,6 +491,7 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
         logfile=workdir / "pass4.log",
         cwd=workdir,
     )
+    _require(workdir / "notes.md", "Pass 4")
     logger.info("  updated %s", workdir / "notes.md")
 
 
@@ -639,6 +725,11 @@ def _require(path: Path, stage_name: str) -> None:
             f"{stage_name} did not produce {path.name} — check the matching "
             f"pass log in {path.parent} before continuing."
         )
+    # Belt-and-suspenders: whatever pi/the model actually wrote, make sure
+    # it doesn't contain a line pi itself can't fully read back in a later
+    # stage. See ensure_no_long_lines() for why this can't be guaranteed
+    # just by prompt instructions alone.
+    ensure_no_long_lines(path)
 
 
 def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
@@ -751,7 +842,9 @@ def main() -> None:
     parser.add_argument("--file", type=Path, default=None,
                          help="Process a single audio file instead of scanning INPUT_DIR")
     parser.add_argument("--model-fast", default=os.environ.get("PI_MODEL_FAST"),
-                         help="Model for extract/enrich passes (env: PI_MODEL_FAST)")
+                         help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
+                              f"Does NOT affect cleanup (pass 0), which is always forced to "
+                              f"the local CLEANUP_MODEL ({CLEANUP_MODEL}) regardless of this flag.")
     parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"),
                          help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT,
