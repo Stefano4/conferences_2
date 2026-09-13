@@ -407,13 +407,26 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     model_fast is accepted (and still used by every other stage) but
     deliberately ignored here: cleanup is forced onto the local CLEANUP_MODEL
     instead, since this pass is mechanical enough not to need a cloud model
-    and runs fully offline via ollama."""
+    and runs fully offline via ollama.
+
+    tools is deliberately "write" only, NOT "read,write": the @attachment
+    mechanism already embeds transcript-raw.txt's full content inline in
+    the prompt pi sends the model (confirmed via pi's own session log — the
+    whole file shows up as a <file> block in the first user message, no
+    size cap), so the model never needs to fetch it again. Offering `read`
+    anyway invites a small local model to redundantly re-read a file it
+    already has in full — and pi's `read` tool caps total output at ~50KB
+    per call regardless of line length, so on a ~55KB transcript that
+    self-read comes back silently truncated (~93% of the file, no loud
+    error) and the model proceeds to "clean" only what it got. Removing
+    `read` here closes that path outright rather than trying to make the
+    truncated read safe to consume."""
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)",
                 CLEANUP_MODEL)
     run_pi(
         attachments=[workdir / "transcript-raw.txt"],
         prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        tools="read,write",
+        tools="write",
         model=CLEANUP_MODEL,
         logfile=workdir / "pass0.log",
         cwd=workdir,
@@ -424,10 +437,14 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
 
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
     logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
+    # tools="write" only, same reasoning as stage_cleanup: transcript.txt is
+    # already fully inlined via @attachment, and this stage never needs to
+    # open any other file, so `read` would only ever be a redundant,
+    # truncation-prone re-fetch of content the model already has.
     run_pi(
         attachments=[workdir / "transcript.txt"],
         prompt_file=PROMPTS_DIR / "pass1-extract.md",
-        tools="read,write",
+        tools="write",
         model=model_fast,
         logfile=workdir / "pass1.log",
         cwd=workdir,
@@ -438,6 +455,10 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     logger.info("[4/7] Pass 2: multi-source enrichment (no API keys)")
+    # `read` kept here (unlike cleanup/extract/synthesize above): this stage
+    # runs bash/curl against external sources and may reasonably want to
+    # read back something it fetched/saved to disk mid-run, so removing it
+    # isn't the same safe no-op it is for the other passes.
     run_pi(
         attachments=[workdir / "extract.md"],
         prompt_file=PROMPTS_DIR / "pass2-enrich.md",
@@ -458,13 +479,16 @@ def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> 
     # sentence-by-sentence record of the talk (see pass1-extract.md's
     # no-ellipsis rule), so re-sending the full transcript on top of it would
     # just burn tokens for content pi already has.
+    # tools="write" only — same reasoning as stage_cleanup/stage_extract:
+    # both attachments are already fully inlined, and this stage never
+    # needs to open any other file.
     run_pi(
         attachments=[
             workdir / "extract.md",
             workdir / "background.md",
         ],
         prompt_file=PROMPTS_DIR / "pass3-synthesize.md",
-        tools="read,write",
+        tools="write",
         model=model_strong,
         logfile=workdir / "pass3.log",
         cwd=workdir,
@@ -479,6 +503,11 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
     # extract.md (not transcript.txt) is the ground truth pass4-verify.md
     # actually checks the speaker's-view sentences against, so it's attached
     # here instead of the full transcript.
+    # `read` kept here (unlike cleanup/extract/synthesize above): this pass
+    # uses `edit` to annotate notes.md in place, which likely needs to read
+    # current file state to locate exact text to replace — not the same
+    # safe no-op removing `read` is for a pass that only ever writes fresh
+    # output from fully-inlined attachments.
     run_pi(
         attachments=[
             workdir / "notes.md",
