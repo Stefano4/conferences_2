@@ -462,7 +462,7 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     run_pi(
         attachments=[workdir / "extract.md"],
         prompt_file=PROMPTS_DIR / "pass2-enrich.md",
-        tools="read,write,bash",
+        tools="read,write,bash,webaio",
         model=model_fast,
         logfile=workdir / "pass2.log",
         cwd=workdir,

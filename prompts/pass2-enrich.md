@@ -3,13 +3,14 @@ first (it.wikipedia.org / it.wiktionary.org, as below), and write
 `background.md` in Italian — paraphrase every finding in Italian even when
 the source itself (e.g. an arXiv abstract) is in English.
 
-You have a `bash` tool with network access. Your ONLY job is to gather
+You have `bash` and `webaio` tools with network access. Your ONLY job is to gather
 background information for the topics/entities listed in `extract.md`. You
 must NOT rely on your own training knowledge for facts — every fact you
 write down must come from a response you actually fetched in this session.
 No API keys are available or needed — every source below is free/open.
 
-Technical notes for the curl calls below:
+Use webaio as first choice.
+As a second fallback choice use bash with curl calls, below some instruction for curl:
 - URL-encode each term before inserting it into a query string (e.g.
   replace spaces with `%20` or `+`) — an unencoded multi-word term will
   break the request.
