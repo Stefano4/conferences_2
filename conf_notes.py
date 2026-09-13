@@ -6,13 +6,13 @@ notes HTML file, and a notes PDF (4 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API
 key needed). The raw transcript is first lightly cleaned up by pi (also
-forced to run on a local model — see CLEANUP_MODEL below — so this pass
+forced to run on a local model — see LOCAL_MODEL below — so this pass
 stays fully offline too), then that cleaned transcript feeds a 4-pass pi
 pipeline:
   0. cleanup      — de-dupe/de-hallucinate raw whisper output, drop filler
                     ("grazie grazie"-style repeats), fix obvious typos —
                     no content removed, nothing paraphrased. Runs on
-                    CLEANUP_MODEL (local, via ollama), not --model-fast.
+                    LOCAL_MODEL (local, via ollama), not --model-fast.
   1. extract     — pull claims/topics/quotes from the cleaned transcript only
   2. enrich       — look up each topic across free, no-key sources
   3. synthesize   — combine into full academic notes, nothing dropped
@@ -117,7 +117,7 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 # never leaves the machine and doesn't spend cloud-model budget on a pass
 # that doesn't need a strong model. See stage_cleanup() below, which passes
 # this constant to pi regardless of what --model-fast is set to.
-CLEANUP_MODEL = "gemma4:e4b-mlx"
+LOCAL_MODEL = "gemma4:e4b-mlx"
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
@@ -282,6 +282,7 @@ def run_pi(
     logfile: Path,
     cwd: Path,
     substitutions: dict[str, str] | None = None,
+    no_extensions: bool = False,
 ) -> None:
     """Invoke pi non-interactively: pi -p @file1 @file2 "<prompt>" --tools ...
 
@@ -292,6 +293,20 @@ def run_pi(
     pi writes/reads relative filenames wherever this script happened to be
     launched from, not into workdir, and the pipeline silently looks for
     its output in the wrong place.
+
+    no_extensions=True passes pi's own `--no-extensions` flag, which
+    disables extension discovery for just this call (built-in tools —
+    read/write/edit/bash/grep/find/ls — are unaffected; only extensions are
+    skipped). Needed for calls that force a specific model via `model`
+    (currently just stage_cleanup's LOCAL_MODEL): pi's own provider
+    fallback/retry behavior lives in an installed extension (e.g.
+    pi-model-fallback), not the core CLI, and it silently reroutes a call
+    to a *different* model on a provider error regardless of what
+    --model was set to — so an explicit --model is only a suggestion
+    unless extensions are switched off for that call. See stage_cleanup's
+    docstring for the run that surfaced this (a truncated-read confusion
+    on the local model triggered several minutes of cascading fallback
+    through paid cloud models before the pass finally completed).
     """
     prompt_text = prompt_file.read_text()
     # Fill in any values the script already knows (e.g. the talk's date,
@@ -307,6 +322,8 @@ def run_pi(
     cmd += ["--tools", tools]
     if model:
         cmd += ["--model", model]
+    if no_extensions:
+        cmd += ["--no-extensions"]
     # Extra flags for pi itself (e.g. a verbosity/debug flag so it prints
     # which provider/model in provider-fallback.json actually served each
     # request). Flag name varies by pi version/config, so it's left as an
@@ -314,9 +331,10 @@ def run_pi(
     # e.g.: export PI_EXTRA_ARGS="--log-level debug"
     cmd += os.environ.get("PI_EXTRA_ARGS", "").split()
 
-    logger.info("Running pi (cwd=%s): pi -p %s ... --tools %s%s",
+    logger.info("Running pi (cwd=%s): pi -p %s ... --tools %s%s%s",
                 cwd, " ".join(f"@{p.name}" for p in attachments),
-                tools, f" --model {model}" if model else "")
+                tools, f" --model {model}" if model else "",
+                " --no-extensions" if no_extensions else "")
 
     # Stream instead of subprocess.run(): the old version piped stdout
     # straight into logfile with a raw open(), bypassing the logging
@@ -405,8 +423,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     stage (extract, and the final transcript PDF) actually consumes.
 
     model_fast is accepted (and still used by every other stage) but
-    deliberately ignored here: cleanup is forced onto the local CLEANUP_MODEL
-    instead, since this pass is mechanical enough not to need a cloud model
+    deliberately ignored here: cleanup is forced onto LOCAL_MODEL instead, since this pass is mechanical enough not to need a cloud model
     and runs fully offline via ollama.
 
     tools is deliberately "write" only, NOT "read,write": the @attachment
@@ -422,14 +439,15 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     `read` here closes that path outright rather than trying to make the
     truncated read safe to consume."""
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)",
-                CLEANUP_MODEL)
+                LOCAL_MODEL)
     run_pi(
         attachments=[workdir / "transcript-raw.txt"],
         prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
         tools="write",
-        model=CLEANUP_MODEL,
+        model=LOCAL_MODEL,
         logfile=workdir / "pass0.log",
         cwd=workdir,
+        no_extensions=True,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
@@ -873,7 +891,7 @@ def main() -> None:
     parser.add_argument("--model-fast", default=os.environ.get("PI_MODEL_FAST"),
                          help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
                               f"Does NOT affect cleanup (pass 0), which is always forced to "
-                              f"the local CLEANUP_MODEL ({CLEANUP_MODEL}) regardless of this flag.")
+                              f"the LOCAL_MODEL ({LOCAL_MODEL}) regardless of this flag.")
     parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"),
                          help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT,
