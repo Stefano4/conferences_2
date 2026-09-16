@@ -117,7 +117,8 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 # never leaves the machine and doesn't spend cloud-model budget on a pass
 # that doesn't need a strong model. See stage_cleanup() below, which passes
 # this constant to pi regardless of what --model-fast is set to.
-CLEANUP_MODEL = "gemini-flash-lite-latest" #"gemma4:e4b-mlx"
+GEMINI_MODEL_1 = "gemini-flash-lite-latest" #"gemma4:e4b-mlx"
+LOCAL_MODEL = "gemma4:e4b-mlx"
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
@@ -277,7 +278,7 @@ def run_pi(
     *,
     attachments: list[Path],
     prompt_file: Path,
-    tools: str,
+    tools: str | None,
     model: str | None,
     logfile: Path,
     cwd: Path,
@@ -304,7 +305,8 @@ def run_pi(
     cmd = ["pi", "-p"]
     cmd += [f"@{p}" for p in attachments]
     cmd += [prompt_text]
-    cmd += ["--tools", tools]
+    if tools:
+        cmd += ["--tools", tools]
     if model:
         cmd += ["--model", model]
     # Extra flags for pi itself (e.g. a verbosity/debug flag so it prints
@@ -422,12 +424,12 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     `read` here closes that path outright rather than trying to make the
     truncated read safe to consume."""
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)",
-                CLEANUP_MODEL)
+                GEMINI_MODEL_1)
     run_pi(
         attachments=[workdir / "transcript-raw.txt"],
         prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
         tools="write",
-        model=CLEANUP_MODEL,
+        model=GEMINI_MODEL_1,
         logfile=workdir / "pass0.log",
         cwd=workdir,
     )
@@ -445,7 +447,7 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
         attachments=[workdir / "transcript.txt"],
         prompt_file=PROMPTS_DIR / "pass1-extract.md",
         tools="write",
-        model=model_fast,
+        model=GEMINI_MODEL_1,
         logfile=workdir / "pass1.log",
         cwd=workdir,
     )
@@ -462,8 +464,8 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     run_pi(
         attachments=[workdir / "extract.md"],
         prompt_file=PROMPTS_DIR / "pass2-enrich.md",
-        tools="read,write,bash,webaio",
-        model=model_fast,
+        tools= None,
+        model=LOCAL_MODEL,
         logfile=workdir / "pass2.log",
         cwd=workdir,
     )
@@ -489,7 +491,7 @@ def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> 
         ],
         prompt_file=PROMPTS_DIR / "pass3-synthesize.md",
         tools="write",
-        model=model_strong,
+        model=GEMINI_MODEL_1,
         logfile=workdir / "pass3.log",
         cwd=workdir,
         substitutions={"{{DATA}}": date_str},
@@ -516,7 +518,7 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
         ],
         prompt_file=PROMPTS_DIR / "pass4-verify.md",
         tools="read,write,edit",
-        model=model_strong,
+        model=GEMINI_MODEL_1,
         logfile=workdir / "pass4.log",
         cwd=workdir,
     )
@@ -871,9 +873,9 @@ def main() -> None:
     parser.add_argument("--file", type=Path, default=None,
                          help="Process a single audio file instead of scanning INPUT_DIR")
     parser.add_argument("--model-fast", default=os.environ.get("PI_MODEL_FAST"),
-                         help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
+                        help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
                               f"Does NOT affect cleanup (pass 0), which is always forced to "
-                              f"the local CLEANUP_MODEL ({CLEANUP_MODEL}) regardless of this flag.")
+                              f"the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.")
     parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"),
                          help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT,
