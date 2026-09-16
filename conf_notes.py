@@ -54,7 +54,9 @@ import html
 import logging
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -347,24 +349,71 @@ def run_pi(
     # into the main run log so it's visible live with -v.
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=cwd, text=True, bufsize=1,
-        # Without this, pi inherits this script's stdin — a real TTY when
-        # run interactively — so it sees isatty()==True, assumes it's an
-        # interactive session, and after printing its one-shot response
-        # drops into its REPL waiting on stdin for the next message, which
-        # never comes. Closing stdin gives it immediate EOF so it exits
-        # right after answering instead of hanging on batch 2+.
-        stdin=subprocess.DEVNULL,
+        cwd=cwd, text=False, bufsize=0,
+        # NOTE: this looks equivalent to stdin=subprocess.DEVNULL but is
+        # NOT — that was the actual bug. pi has a confirmed, still-open
+        # issue (earendil-works/pi#4303): in -p/print mode, if stdin is
+        # /dev/null it emits its full response and then never exits,
+        # sitting in epoll_wait forever; but if stdin is a *pipe* that's
+        # closed immediately (even one that received zero bytes), it
+        # exits normally right after finishing. So we must hand it a
+        # closed pipe, not /dev/null, even though both "look like" EOF
+        # with nothing to read.
+        stdin=subprocess.PIPE,
+        # New process group so we can clean up any straggler descendants
+        # below (see the killpg call) without touching this script itself.
+        start_new_session=True,
     )
+    proc.stdin.close()
 
+    # Read with a poll/timeout loop instead of `for line in proc.stdout`.
+    # That plain form blocks until the pipe gets EOF, which requires every
+    # process holding the write end open to close it — not just pi itself.
+    # pi's tools (aio-websearch in particular looks like it shells out to
+    # fetch/render pages) can spawn a subprocess that inherits this pipe's
+    # fd and never explicitly closes it. When that happens, pi finishes,
+    # prints its answer, and exits cleanly, but the pipe never sees EOF
+    # because a grandchild is still holding it open — so the old loop sat
+    # there forever after batch 1's very output you saw. Polling lets us
+    # treat "pi's own process has exited" as the real completion signal,
+    # independent of whatever else might still be holding the pipe.
+    buf = b""
     with open(logfile, "w") as lf:
-        for line in proc.stdout:
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace")
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        lf.write(f"{ts} {line}\n")
+                        lf.flush()
+                        logger.debug("[pi] %s", line)
+                    continue  # more may be buffered; keep draining first
+            # No data ready right now. If pi's own process has already
+            # exited, we're done — anything still holding the pipe open
+            # is a leftover grandchild, not pi, so stop waiting on it.
+            if proc.poll() is not None:
+                break
+        if buf:
+            line = buf.decode("utf-8", errors="replace")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            lf.write(f"{ts} {line}")
-            lf.flush()
-            logger.debug("[pi] %s", line.rstrip())
+            lf.write(f"{ts} {line}\n")
+            logger.debug("[pi] %s", line)
 
-    returncode = proc.wait()
+    returncode = proc.returncode
+
+    # Best-effort cleanup of any leftover descendants (e.g. a headless
+    # browser/fetcher aio-websearch spawned) so they don't pile up over
+    # 53 batches instead of being reaped when pi itself exited.
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
     if returncode != 0:
         raise RuntimeError(
             f"pi call failed (exit {returncode}). See {logfile} for details."
@@ -490,7 +539,7 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     if not items:
         raise RuntimeError("No topics/entities found in extract.md")
 
-    BATCH_SIZE = 1  # tweak as needed
+    BATCH_SIZE = 8  # tweak as needed
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
     logger.info("  splitting %d items into %d batches of up to %d",
                 len(items), len(batches), BATCH_SIZE)
@@ -513,11 +562,7 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
         run_pi(
             attachments=[],                     # no attachment needed
             prompt_file=prompt_file,
-            tools=None,        # left unrestricted on purpose: passing --tools to
-                               # scope this down to just aio-websearch+write made pi
-                               # stop using aio-websearch (it's a package/extension,
-                               # not a plain tool name pi's --tools flag recognizes),
-                               # so this batch runs with pi's full default tool set
+            tools=None,
             model=LOCAL_MODEL,
             logfile=workdir / f"pass2_batch_{idx}.log",
             cwd=workdir,
