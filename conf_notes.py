@@ -157,6 +157,24 @@ def _format_italian_date(y: int, m: int, d: int) -> str | None:
         return f"{d} {_ITALIAN_MONTHS[m - 1]} {y}"
     return None
 
+def _parse_extract_items(extract_path: Path) -> list[str]:
+    """Return every topic/entity listed under 'Topics & concepts mentioned'
+    and 'Named entities' in extract.md."""
+    lines = extract_path.read_text().splitlines()
+    items = []
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## Topics & concepts mentioned") or stripped.startswith("## Named entities"):
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith("## "):
+                in_section = False
+                continue
+            if stripped.startswith("- "):
+                items.append(stripped[2:].strip())
+    return items
 
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
@@ -330,6 +348,13 @@ def run_pi(
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         cwd=cwd, text=True, bufsize=1,
+        # Without this, pi inherits this script's stdin — a real TTY when
+        # run interactively — so it sees isatty()==True, assumes it's an
+        # interactive session, and after printing its one-shot response
+        # drops into its REPL waiting on stdin for the next message, which
+        # never comes. Closing stdin gives it immediate EOF so it exits
+        # right after answering instead of hanging on batch 2+.
+        stdin=subprocess.DEVNULL,
     )
 
     with open(logfile, "w") as lf:
@@ -456,21 +481,67 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
-    logger.info("[4/7] Pass 2: multi-source enrichment (no API keys)")
-    # `read` kept here (unlike cleanup/extract/synthesize above): this stage
-    # runs bash/curl against external sources and may reasonably want to
-    # read back something it fetched/saved to disk mid-run, so removing it
-    # isn't the same safe no-op it is for the other passes.
-    run_pi(
-        attachments=[workdir / "extract.md"],
-        prompt_file=PROMPTS_DIR / "pass2-enrich.md",
-        tools= None,
-        model=LOCAL_MODEL,
-        logfile=workdir / "pass2.log",
-        cwd=workdir,
-    )
-    _require(workdir / "background.md", "Pass 2")
-    logger.info("  wrote %s", workdir / "background.md")
+    logger.info("[4/7] Pass 2: multi-source enrichment (batched)")
+    extract_path = workdir / "extract.md"
+    if not extract_path.exists():
+        raise RuntimeError("extract.md not found — cannot run enrichment")
+
+    items = _parse_extract_items(extract_path)
+    if not items:
+        raise RuntimeError("No topics/entities found in extract.md")
+
+    BATCH_SIZE = 1  # tweak as needed
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    logger.info("  splitting %d items into %d batches of up to %d",
+                len(items), len(batches), BATCH_SIZE)
+
+    batch_files = []
+    base_prompt = (PROMPTS_DIR / "pass2-enrich.md").read_text()
+
+    for idx, batch in enumerate(batches):
+        batch_file = workdir / f"background_batch_{idx}.md"
+        prompt_file = workdir / f"pass2_batch_{idx}_prompt.md"
+
+        items_block = "\n".join(f"- {item}" for item in batch)
+        prompt_text = base_prompt.replace("{{ITEMS}}", items_block)
+        prompt_text = prompt_text.replace("{{OUTPUT_FILE}}", batch_file.name)
+        prompt_file.write_text(prompt_text)
+
+        logger.info("  batch %d/%d: %d items -> %s",
+                    idx + 1, len(batches), len(batch), batch_file.name)
+
+        run_pi(
+            attachments=[],                     # no attachment needed
+            prompt_file=prompt_file,
+            tools=None,        # left unrestricted on purpose: passing --tools to
+                               # scope this down to just aio-websearch+write made pi
+                               # stop using aio-websearch (it's a package/extension,
+                               # not a plain tool name pi's --tools flag recognizes),
+                               # so this batch runs with pi's full default tool set
+            model=LOCAL_MODEL,
+            logfile=workdir / f"pass2_batch_{idx}.log",
+            cwd=workdir,
+        )
+        batch_files.append(batch_file)
+
+    # Combine all batch outputs into background.md
+    combined = []
+    for bf in batch_files:
+        if bf.exists():
+            content = bf.read_text().strip()
+            if content:
+                combined.append(content)
+        else:
+            logger.warning("  batch file %s was not created", bf.name)
+
+    if not combined:
+        raise RuntimeError("Pass 2 produced no background content in any batch")
+
+    background_md = workdir / "background.md"
+    background_md.write_text("\n\n".join(combined))
+    logger.info("  wrote %s by combining %d batch files", background_md, len(batch_files))
+
+    _require(background_md, "Pass 2")
 
 
 def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
