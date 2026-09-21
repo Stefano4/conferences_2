@@ -1,80 +1,60 @@
 #!/usr/bin/env python3
 """
-conf_notes.py — batch pipeline: scans an input folder for recordings and,
-one at a time, turns each into a transcript PDF, a notes markdown file, a
-notes HTML file, and a notes PDF (4 files per recording).
+conf_notes.py — batch pipeline: scans an input folder for recordings and, one at a time,
+turns each into a transcript PDF, a notes markdown file, a notes HTML file, and a notes
+PDF (4 files per recording).
 
-Transcription is done locally with mlx-whisper (no cloud calls, no API
-key needed). The raw transcript is first lightly cleaned up by pi (also
-forced to run on a local model — see CLEANUP_MODEL below — so this pass
-stays fully offline too), then that cleaned transcript feeds a 4-pass pi
-pipeline:
-  0. cleanup      — de-dupe/de-hallucinate raw whisper output, drop filler
-                    ("grazie grazie"-style repeats), fix obvious typos —
-                    no content removed, nothing paraphrased. Runs on
-                    CLEANUP_MODEL (local, via ollama), not --model-fast.
-  1. extract     — pull claims/topics/quotes from the cleaned transcript only
-  2. enrich       — look up each topic across free, no-key sources
-  3. synthesize   — combine into full academic notes, nothing dropped
-  4. verify       — flag (never delete) anything not traceable to a source
+Transcription is done locally with mlx-whisper (no cloud calls, no API key needed). The
+raw transcript is first lightly cleaned up by pi (forced onto a local model — see
+GEMINI_MODEL_2 — so this pass stays fully offline too), then that cleaned transcript
+feeds a 4-pass pi pipeline:
+  0. cleanup     — de-dupe/de-hallucinate raw whisper output, drop filler repeats, fix
+                   obvious typos. No content removed, nothing paraphrased.
+  1. extract     — pull claims/topics/quotes from the cleaned transcript only.
+  2. enrich      — look up each topic across free, no-key sources.
+  3. synthesize  — combine into full academic notes, nothing dropped.
+  4. verify      — flag (never delete) anything not traceable to a source.
 
-Only pass 1 (extract) and pass 0 (cleanup) ever see the transcript text
-itself — passes 2-4 work from extract.md/background.md/notes.md, which
-already contain everything they need, so the (much longer) transcript
-isn't re-sent to pi on every later pass.
+Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — passes 2-4
+work from extract.md/background.md/notes.md, which already contain everything they need,
+so the (much longer) transcript isn't re-sent to pi on every later pass.
 
 Folder layout (created automatically next to the script if missing):
-  input/   — drop recordings here; processed files are moved to
-             input/processed/ so reruns don't redo them
-  output/  — final "<name>-notes.md", "<name>-notes.html",
-             "<name>-notes.pdf", and "<name>-transcript.pdf" land here
-             (4 files per recording)
-  logs/    — one log file per run, named yyyy-MM-dd_hh-mm_<name>.log
+  input/   — drop recordings here; processed files move to input/processed/ so reruns
+             don't redo them.
+  output/  — final "<name>-notes.{md,html,pdf}" and "<name>-transcript.pdf" land here.
+  logs/    — one log file per run, named yyyy-MM-dd_hh-mm_<name>.log.
 
 Requirements:
     pip install mlx-whisper weasyprint markdown
     brew install cairo pango gdk-pixbuf libffi ffmpeg   # WeasyPrint + mlx-whisper native deps
     pi CLI already installed and configured with your provider fallbacks
 
-macOS note: if WeasyPrint fails to import with a library-loading error,
-Homebrew's libs usually just aren't on the dynamic linker's search path —
-see check_environment()'s error message for the exact fix (one `export`).
+macOS note: if WeasyPrint fails to import with a library-loading error, Homebrew's libs
+usually just aren't on the dynamic linker's search path — see check_environment()'s error
+message for the exact fix (one `export`).
 
 Usage:
-    python conf_notes.py                     # scan INPUT_DIR, process all found
-    python conf_notes.py --file talk.m4a      # process a single file instead
-    python conf_notes.py --file talk.m4a --from-stage synthesize   # debug/rerun
-    python conf_notes.py -v                   # debug-level console logging
+    python conf_notes.py                                            # scan INPUT_DIR
+    python conf_notes.py --file talk.m4a                             # single file
+    python conf_notes.py --file talk.m4a --from-stage synthesize     # debug/rerun
+    python conf_notes.py -v                                          # debug console log
 """
 
 from __future__ import annotations
-import argparse
-import html
-import logging
-import os
-import re
-import select
-import shutil
-import signal
-import subprocess
-import sys
-import time
+import argparse, html, logging, os, re, select, shutil, signal, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
-# --- Optional third-party imports, resolved once at startup ----------------
-# Kept optional (not a hard `import` at call time) so a missing backend
-# degrades gracefully instead of crashing the whole script.
-# WeasyPrint in particular can fail with OSError (not ImportError) when it
-# can't dlopen its native libraries (pango/cairo/gdk-pixbuf) — see
-# check_environment() below for the macOS fix.
-# Pin the HuggingFace cache to a fixed folder next to the script *before*
-# mlx_whisper/huggingface_hub are imported. Without this, the cache
-# location depends on $HOME at the time of the call — if this script is
-# ever run from cron/launchd/a different shell with a different (or
-# unset) $HOME, huggingface_hub resolves to a different cache dir and it
-# looks like the model gets re-downloaded every day even though nothing
-# is actually wrong with the download itself.
+# --- Optional third-party imports, resolved once at startup ----------------------------
+# Kept optional so a missing backend degrades gracefully instead of crashing the script.
+# WeasyPrint can fail with OSError (not ImportError) when it can't dlopen its native libs
+# (pango/cairo/gdk-pixbuf) — see check_environment() for the macOS fix.
+#
+# Pin HF_HOME *before* mlx_whisper/huggingface_hub are imported: otherwise the cache
+# location depends on $HOME at call time, so running from cron/launchd/a different shell
+# can silently point at a different cache dir and make it look like the model is
+# re-downloaded every day.
 SCRIPT_DIR = Path(__file__).resolve().parent
 os.environ.setdefault("HF_HOME", str(SCRIPT_DIR / ".hf-cache"))
 
@@ -86,8 +66,7 @@ except ImportError:
 try:
     import weasyprint
 except (ImportError, OSError) as _weasyprint_error:
-    weasyprint = None
-    WEASYPRINT_IMPORT_ERROR = str(_weasyprint_error)
+    weasyprint, WEASYPRINT_IMPORT_ERROR = None, str(_weasyprint_error)
 else:
     WEASYPRINT_IMPORT_ERROR = None
 
@@ -95,44 +74,38 @@ try:
     import markdown
 except ImportError:
     markdown = None
-# -----------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------
 
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 WORK_DIR = SCRIPT_DIR / "work"  # scratch space for intermediate files per run
 
-# ---------------------------------------------------------------------------
-# Self-contained: these live next to the script and are created automatically
-# if missing. Override with different absolute paths here if you'd rather
-# keep recordings/output somewhere else (e.g. iCloud Drive, an external disk).
+# Self-contained: these live next to the script and are created automatically if missing.
+# Override with absolute paths here to keep recordings/output elsewhere (iCloud, external disk).
 INPUT_DIR = SCRIPT_DIR / "input"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 LOG_DIR = SCRIPT_DIR / "logs"
-# ---------------------------------------------------------------------------
 
 STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", "pdf"]
 WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
 
-# Pass 0 (cleanup) is light, mechanical work (de-dupe/de-hallucinate/typo-fix
-# on the raw whisper output, no real reasoning about content) so it's forced
-# to run on a local ollama model instead of --model-fast/PI_MODEL_FAST — it
-# never leaves the machine and doesn't spend cloud-model budget on a pass
-# that doesn't need a strong model. See stage_cleanup() below, which passes
-# this constant to pi regardless of what --model-fast is set to.
+# Pass 0 (cleanup) is light, mechanical work (de-dupe/de-hallucinate/typo-fix, no real
+# reasoning about content) so it's forced onto a local model instead of --model-fast —
+# it never leaves the machine and doesn't spend cloud-model budget on a pass that
+# doesn't need a strong model. See stage_cleanup(), which always passes this model.
 GEMINI_MODEL_1 = "gemini-flash-lite-latest"  # "gemma4:e4b-mlx"
-GEMINI_MODEL_2 = "gemini-3.1-flash-lite"  # "gemma4:e4b-mlx"
+GEMINI_MODEL_2 = "gemini-3.1-flash-lite"     # "gemma4:e4b-mlx"
 LOCAL_MODEL = "gemma4:e4b-mlx"
 PI_TIMEOUT_SECONDS = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
 BATCH_SIZE = 80
 
-# Files each stage needs already present when resuming with --from-stage
-# (irrelevant for a normal full run, where the prior stage just wrote them).
+# Files each stage needs already present when resuming with --from-stage (irrelevant for
+# a normal full run, where the prior stage just wrote them).
 #
-# Note: only "cleanup" and "extract" need the (raw/cleaned) transcript text.
-# From "synthesize" onward, extract.md's "Speaker's claims & arguments"
-# section is already a compressed-but-complete sentence-by-sentence record
-# of the talk, so the full transcript is not re-attached to later pi calls
-# (it's long, and re-sending it on every pass just burns tokens for no
+# Only "cleanup" and "extract" need the (raw/cleaned) transcript text. From "synthesize"
+# onward, extract.md's "Speaker's claims & arguments" section is already a
+# compressed-but-complete sentence-by-sentence record of the talk, so the full transcript
+# isn't re-attached to later pi calls (it's long, and re-sending it burns tokens for no
 # extra information pi doesn't already have via extract.md).
 STAGE_REQUIRES = {
     "cleanup": ["transcript-raw.txt"],
@@ -143,13 +116,14 @@ STAGE_REQUIRES = {
     "pdf": ["notes.md", "transcript.txt"],
 }
 
-_ITALIAN_MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
-                   "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+_ITALIAN_MONTHS = [
+    "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre",
+]
 
-# Date patterns to look for in a recording's filename, tried in order.
-# Each tuple is (regex, group order). Deliberately conservative (requires
-# 4-digit years, non-digit boundaries) to avoid false positives on
-# filenames that just happen to contain other numbers.
+# Date patterns to try, in order, against a recording's filename. Each tuple is
+# (regex, group order). Deliberately conservative (4-digit years, non-digit boundaries)
+# to avoid false positives on filenames that just happen to contain other numbers.
 _DATE_PATTERNS = [
     (re.compile(r"(?<!\d)(\d{4})[-_.](\d{2})[-_.](\d{2})(?!\d)"), "ymd"),
     (re.compile(r"(?<!\d)(\d{2})[-_.](\d{2})[-_.](\d{4})(?!\d)"), "dmy"),
@@ -164,12 +138,10 @@ def _format_italian_date(y: int, m: int, d: int) -> str | None:
 
 
 def _parse_extract_items(extract_path: Path) -> list[str]:
-    """Return every topic/entity listed under 'Topics & concepts mentioned'
-    and 'Named entities' in extract.md."""
-    lines = extract_path.read_text().splitlines()
-    items = []
-    in_section = False
-    for line in lines:
+    """Return every topic/entity listed under 'Topics & concepts mentioned' and
+    'Named entities' in extract.md."""
+    items, in_section = [], False
+    for line in extract_path.read_text().splitlines():
         stripped = line.strip()
         if stripped.startswith("## Topics & concepts mentioned") or stripped.startswith("## Named entities"):
             in_section = True
@@ -177,8 +149,7 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
         if in_section:
             if stripped.startswith("## "):
                 in_section = False
-                continue
-            if stripped.startswith("- "):
+            elif stripped.startswith("- "):
                 items.append(stripped[2:].strip())
     return items
 
@@ -186,17 +157,15 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
 
-    The speaker rarely states the date out loud in a conference talk, so
-    asking pi to find it in the transcript fails most of the time (see
-    extract.md's Session metadata section usually saying "not stated").
-    We derive it ourselves instead and hand it to pi as a fixed value to
-    drop in, rather than a lookup task for it to attempt and get wrong.
+    The speaker rarely states the date out loud, so asking pi to find it in the
+    transcript fails most of the time (extract.md's Session metadata usually says "not
+    stated"). We derive it ourselves and hand it to pi as a fixed value instead of a
+    lookup task it would likely get wrong.
 
-    Tries common date patterns in the filename first (most reliable,
-    since recordings are typically named by whoever made them, e.g.
-    "2026-03-05_convegno.m4a"), then falls back to the file's
-    last-modified time, clearly labelled as such since it's a weaker
-    signal (could be a copy/export date rather than the talk's date).
+    Tries common date patterns in the filename first (recordings are typically named by
+    whoever made them, e.g. "2026-03-05_convegno.m4a"), then falls back to the file's
+    last-modified time, clearly labelled as a weaker signal (could be a copy/export date
+    rather than the talk's date).
     """
     name = audio.stem
     for pattern, order in _DATE_PATTERNS:
@@ -215,7 +184,6 @@ def derive_date_from_filename(audio: Path) -> str:
             return f"{formatted} (dedotta dalla data del file, non dal nome file)"
     except OSError:
         pass
-
     return "non determinata"
 
 
@@ -241,35 +209,29 @@ def setup_logging(logfile: Path, verbose: bool) -> None:
 def discover_audio_files(input_dir: Path) -> list[Path]:
     if not input_dir.exists():
         return []
-    files = [
-        p for p in input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
-    ]
+    files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS]
     return sorted(files, key=lambda p: p.name)
 
 
-# Pi's `read` tool truncates (silently, per line) at roughly this many bytes
-# — see run_pi()'s docstring. Kept as its own constant (not folded into
-# run_pi) since it's a property of pi's read tool, not of how we invoke pi.
+# Pi's `read` tool truncates (silently, per line) at roughly this many bytes — see
+# run_pi()'s docstring. Kept as its own constant since it's a property of pi's read
+# tool, not of how we invoke pi.
 PI_READ_LINE_LIMIT_BYTES = 50_000
 
 
 def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) -> None:
-    """Safety net: insert line breaks at whitespace so no single line in
-    `path` exceeds max_bytes, without changing any word or character in the
-    file — only where the newlines fall.
+    """Safety net: insert line breaks at whitespace so no line in `path` exceeds
+    max_bytes, without changing any word/character in the file — only where the
+    newlines fall.
 
-    Why this exists in addition to transcribe_with_local_whisper() writing
-    transcript-raw.txt pre-split into short lines: that only guarantees the
-    *first* file pi reads is safe. Every later stage's output is written by
-    pi itself (following prompt instructions like "keep line breaks as in
-    the original"), and a model — especially a small local one — isn't
-    guaranteed to honor that. If e.g. pass 0's cleanup model flattens
-    transcript.txt back into one long paragraph while "cleaning" it, pass 1
-    would silently see only a truncated prefix of the talk, with no error
-    raised anywhere. Called on every stage's output file right after
-    _require() confirms it exists, so this holds regardless of what the
-    model actually did with formatting.
+    This exists in addition to transcribe_with_local_whisper() pre-splitting
+    transcript-raw.txt, because that only guarantees the *first* file pi reads is safe.
+    Every later stage's output is written by pi itself (following prompt instructions
+    like "keep line breaks as in the original"), and a model — especially a small local
+    one — isn't guaranteed to honor that. If e.g. pass 0's cleanup model flattens
+    transcript.txt back into one long paragraph while "cleaning" it, pass 1 would
+    silently see only a truncated prefix of the talk, with no error raised anywhere.
+    Called on every stage's output right after _require() confirms it exists.
     """
     text = path.read_text()
     lines = text.split("\n")
@@ -281,8 +243,7 @@ def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) 
         if len(line.encode("utf-8")) <= max_bytes:
             out_lines.append(line)
             continue
-        # Break only at existing spaces, never mid-word, so this can't
-        # alter or split any actual word/character in the transcript.
+        # Break only at existing spaces, never mid-word.
         current = ""
         for word in line.split(" "):
             candidate = f"{current} {word}" if current else word
@@ -295,94 +256,68 @@ def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) 
             out_lines.append(current)
 
     path.write_text("\n".join(out_lines))
-    logger.debug("  rewrapped long line(s) in %s to stay under pi's ~%dKB read limit",
-                 path.name, max_bytes // 1000)
+    logger.debug("  rewrapped long line(s) in %s to stay under pi's ~%dKB read limit", path.name, max_bytes // 1000)
 
 
 def run_pi(
-        *,
-        attachments: list[Path],
-        prompt_file: Path,
-        tools: str | None,
-        model: str | None,
-        logfile: Path,
-        cwd: Path,
-        substitutions: dict[str, str] | None = None,
+    *, attachments: list[Path], prompt_file: Path, tools: str | None, model: str | None,
+    logfile: Path, cwd: Path, substitutions: dict[str, str] | None = None,
 ) -> None:
     """Invoke pi non-interactively: pi -p @file1 @file2 "<prompt>" --tools ...
 
-    pi resolves relative file operations (like "write to extract.md")
-    against its own process working directory, not against the paths of
-    any @attachments — there's no --cwd flag (see earendil-works/pi#4745),
-    so we set the subprocess's cwd explicitly to `workdir`. Without this,
-    pi writes/reads relative filenames wherever this script happened to be
-    launched from, not into workdir, and the pipeline silently looks for
-    its output in the wrong place.
+    pi resolves relative file operations (e.g. "write to extract.md") against its own
+    process cwd, not against the @attachments' paths — there's no --cwd flag (see
+    earendil-works/pi#4745) — so we set the subprocess cwd explicitly to `workdir`.
+    Without this, pi writes/reads relative filenames wherever this script happened to be
+    launched from, and the pipeline silently looks for output in the wrong place.
     """
     prompt_text = prompt_file.read_text()
-    # Fill in any values the script already knows (e.g. the talk's date,
-    # derived from the filename) instead of leaving pi to infer them from
-    # the transcript, which is unreliable for things speakers rarely
-    # state out loud.
+    # Fill in values the script already knows (e.g. the talk's date, derived from the
+    # filename) instead of leaving pi to infer them from the transcript, which is
+    # unreliable for things speakers rarely state out loud.
     for key, value in (substitutions or {}).items():
         prompt_text = prompt_text.replace(key, value)
 
-    cmd = ["pi", "-p"]
-    cmd += [f"@{p}" for p in attachments]
-    cmd += [prompt_text]
-    cmd += [" --no-notify "]
+    cmd = ["pi", "-p"] + [f"@{p}" for p in attachments] + [prompt_text, " --no-notify "]
     if tools:
         cmd += ["--tools", tools]
     if model:
         cmd += ["--model", model]
-    # Extra flags for pi itself (e.g. a verbosity/debug flag so it prints
-    # which provider/model in provider-fallback.json actually served each
-    # request). Flag name varies by pi version/config, so it's left as an
-    # opt-in env var rather than hardcoded — check `pi --help` for yours,
-    # e.g.: export PI_EXTRA_ARGS="--log-level debug"
+    # Extra flags for pi itself (e.g. a debug flag printing which provider/model in
+    # provider-fallback.json actually served each request). Varies by pi version/config,
+    # so it's an opt-in env var: export PI_EXTRA_ARGS="--log-level debug"
     cmd += os.environ.get("PI_EXTRA_ARGS", "").split()
 
-    logger.info("Running pi (cwd=%s): pi -p %s ... --tools %s%s",
-                cwd, " ".join(f"@{p.name}" for p in attachments),
-                tools, f" --model {model}" if model else "")
+    logger.info(
+        "Running pi (cwd=%s): pi -p %s ... --tools %s%s",
+        cwd, " ".join(f"@{p.name}" for p in attachments), tools, f" --model {model}" if model else "",
+    )
 
-    # Stream instead of subprocess.run(): the old version piped stdout
-    # straight into logfile with a raw open(), bypassing the logging
-    # module entirely — so those per-pass log files had no timestamps,
-    # and pi's real-time activity (tool calls, retries, which provider
-    # actually answered) was invisible until the whole call finished.
-    # Streaming line-by-line lets us timestamp every row AND mirror it
-    # into the main run log so it's visible live with -v.
+    # Stream instead of subprocess.run(): piping stdout straight into logfile with a raw
+    # open() bypasses the logging module (no timestamps), and pi's real-time activity
+    # (tool calls, retries, which provider actually answered) stays invisible until the
+    # whole call finishes. Streaming line-by-line lets us timestamp every row and mirror
+    # it into the main run log so it's visible live with -v.
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=cwd, text=False, bufsize=0,
-        # NOTE: this looks equivalent to stdin=subprocess.DEVNULL but is
-        # NOT — that was the actual bug. pi has a confirmed, still-open
-        # issue (earendil-works/pi#4303): in -p/print mode, if stdin is
-        # /dev/null it emits its full response and then never exits,
-        # sitting in epoll_wait forever; but if stdin is a *pipe* that's
-        # closed immediately (even one that received zero bytes), it
-        # exits normally right after finishing. So we must hand it a
-        # closed pipe, not /dev/null, even though both "look like" EOF
-        # with nothing to read.
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, text=False, bufsize=0,
+        # NOTE: stdin=subprocess.PIPE (closed immediately below) is NOT equivalent to
+        # stdin=subprocess.DEVNULL — that was the actual bug. pi has a confirmed,
+        # still-open issue (earendil-works/pi#4303): in -p/print mode, if stdin is
+        # /dev/null it emits its full response and then never exits (sits in
+        # epoll_wait forever); but if stdin is a *pipe* that's closed immediately
+        # (even having received zero bytes), it exits normally right after finishing.
         stdin=subprocess.PIPE,
-        # New process group so we can clean up any straggler descendants
-        # below (see the killpg call) without touching this script itself.
-        start_new_session=True,
+        start_new_session=True,  # own process group, so we can clean up stragglers below
     )
     proc.stdin.close()
 
-    # Read with a poll/timeout loop instead of `for line in proc.stdout`.
-    # That plain form blocks until the pipe gets EOF, which requires every
-    # process holding the write end open to close it — not just pi itself.
-    # pi's tools (aio-websearch in particular looks like it shells out to
-    # fetch/render pages) can spawn a subprocess that inherits this pipe's
-    # fd and never explicitly closes it. When that happens, pi finishes,
-    # prints its answer, and exits cleanly, but the pipe never sees EOF
-    # because a grandchild is still holding it open — so the old loop sat
-    # there forever after batch 1's very output you saw. Polling lets us
-    # treat "pi's own process has exited" as the real completion signal,
-    # independent of whatever else might still be holding the pipe.
+    # Read with a poll/timeout loop instead of `for line in proc.stdout`, which blocks
+    # until EOF — requiring every process holding the write end open to close it, not
+    # just pi. pi's tools (e.g. aio-websearch, which looks like it shells out to
+    # fetch/render pages) can spawn a subprocess that inherits this pipe's fd and never
+    # closes it, so pi finishes and exits cleanly but the pipe never sees EOF because a
+    # grandchild still holds it open. Polling treats "pi's own process has exited" as
+    # the real completion signal, independent of anything else holding the pipe.
     buf = b""
     with open(logfile, "w") as lf:
         started = time.monotonic()
@@ -400,18 +335,14 @@ def run_pi(
                         lf.flush()
                         logger.debug("[pi] %s", line)
                     continue  # more may be buffered; keep draining first
-            # No data ready right now. If pi's own process has already
-            # exited, we're done — anything still holding the pipe open
-            # is a leftover grandchild, not pi, so stop waiting on it.
+            # No data ready. If pi's own process already exited, we're done — anything
+            # still holding the pipe open is a leftover grandchild, not pi.
             if proc.poll() is not None:
                 break
 
             elapsed = time.monotonic() - started
             if elapsed >= PI_TIMEOUT_SECONDS:
-                logger.error(
-                    "pi timed out after %.0f seconds; aborting pipeline",
-                    elapsed,
-                )
+                logger.error("pi timed out after %.0f seconds; aborting pipeline", elapsed)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
@@ -423,9 +354,7 @@ def run_pi(
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
-                raise TimeoutError(
-                    f"pi exceeded the hard timeout of {PI_TIMEOUT_SECONDS}s"
-                )
+                raise TimeoutError(f"pi exceeded the hard timeout of {PI_TIMEOUT_SECONDS}s")
         if buf:
             line = buf.decode("utf-8", errors="replace")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -434,28 +363,24 @@ def run_pi(
 
     returncode = proc.returncode
 
-    # Best-effort cleanup of any leftover descendants (e.g. a headless
-    # browser/fetcher aio-websearch spawned) so they don't pile up over
-    # 53 batches instead of being reaped when pi itself exited.
+    # Best-effort cleanup of leftover descendants (e.g. a headless browser/fetcher
+    # aio-websearch spawned) so they don't pile up over many batches.
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
 
     if returncode != 0:
-        raise RuntimeError(
-            f"pi call failed (exit {returncode}). See {logfile} for details."
-        )
+        raise RuntimeError(f"pi call failed (exit {returncode}). See {logfile} for details.")
 
 
 def _whisper_model_is_cached(whisper_model: str) -> bool:
-    """Best-effort check of whether whisper_model is already in the local
-    HF cache, purely so the log can say which one happened (helps confirm
-    the caching fix is actually working, instead of guessing from timing)."""
+    """Best-effort check of whether whisper_model is already in the local HF cache,
+    purely so the log can confirm the caching fix is working instead of guessing from
+    timing."""
     try:
         from huggingface_hub import scan_cache_dir
-        cached_repos = {repo.repo_id for repo in scan_cache_dir().repos}
-        return whisper_model in cached_repos
+        return whisper_model in {repo.repo_id for repo in scan_cache_dir().repos}
     except Exception:
         return False  # can't tell -> don't claim either way in the log
 
@@ -465,30 +390,24 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
         raise RuntimeError("mlx-whisper not installed. Run: pip install mlx-whisper")
 
     if _whisper_model_is_cached(whisper_model):
-        logger.debug("  Whisper model %s found in cache (%s) — no download needed",
-                     whisper_model, os.environ.get("HF_HOME"))
+        logger.debug("  Whisper model %s found in cache (%s) — no download needed", whisper_model, os.environ.get("HF_HOME"))
     else:
-        logger.info("  Whisper model %s not in cache (%s) — downloading once, "
-                    "will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
+        logger.info("  Whisper model %s not in cache (%s) — downloading once, will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
 
     result = mlx_whisper.transcribe(str(audio), path_or_hf_repo=whisper_model)
 
     # Join whisper's own per-phrase segments with newlines instead of using
-    # result["text"] (one giant single-line string for the whole recording).
-    # A ~1-hour talk produces a ~50-60KB single line, which blows past pi's
-    # per-line read limit (50KB) and silently truncates whatever pass reads
-    # this file first (pass 0 cleanup) to just the opening minutes — with no
-    # error, just a quiet content-loss bug downstream. Segment boundaries are
-    # whisper's own phrase breaks, not a rewording, so this changes nothing
-    # about the transcribed words, only how they're laid out on disk.
+    # result["text"] (one giant single-line string for the whole recording): a ~1-hour
+    # talk produces a ~50-60KB single line, blowing past pi's per-line read limit
+    # (50KB) and silently truncating whatever pass reads this file first (pass 0
+    # cleanup) to just the opening minutes, with no error. Segment boundaries are
+    # whisper's own phrase breaks, not a rewording, so this changes nothing about the
+    # transcribed words, only how they're laid out on disk.
     segments = result.get("segments") or []
     if segments:
         lines = [seg.get("text", "").strip() for seg in segments]
-        lines = [line for line in lines if line]
-        return "\n".join(lines)
-
-    # Fallback if a whisper backend/version ever omits segments.
-    return result["text"].strip()
+        return "\n".join(line for line in lines if line)
+    return result["text"].strip()  # fallback if a whisper backend/version omits segments
 
 
 def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
@@ -502,38 +421,30 @@ def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
 
 
 def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
-    """Light pi pass over the raw whisper output: drop duplicated/hallucinated
-    lines and repeated filler ("grazie grazie", "buongiorno buongiorno", ...)
-    and fix obvious mis-transcription typos — nothing summarized, nothing
-    reworded, no content removed. Writes the transcript.txt that every later
-    stage (extract, and the final transcript PDF) actually consumes.
+    """Light pi pass over the raw whisper output: drop duplicated/hallucinated lines and
+    repeated filler ("grazie grazie", "buongiorno buongiorno", ...), fix obvious
+    mis-transcription typos — nothing summarized, nothing reworded, no content removed.
+    Writes transcript.txt, which every later stage (extract, and the final transcript
+    PDF) actually consumes.
 
-    model_fast is accepted (and still used by every other stage) but
-    deliberately ignored here: cleanup is forced onto the local CLEANUP_MODEL
-    instead, since this pass is mechanical enough not to need a cloud model
-    and runs fully offline via ollama.
+    model_fast is accepted (and used by every other stage) but deliberately ignored
+    here: cleanup is forced onto GEMINI_MODEL_2 since this pass is mechanical enough not
+    to need a cloud model and runs fully offline via ollama.
 
-    tools is deliberately "write" only, NOT "read,write": the @attachment
-    mechanism already embeds transcript-raw.txt's full content inline in
-    the prompt pi sends the model (confirmed via pi's own session log — the
-    whole file shows up as a <file> block in the first user message, no
-    size cap), so the model never needs to fetch it again. Offering `read`
-    anyway invites a small local model to redundantly re-read a file it
-    already has in full — and pi's `read` tool caps total output at ~50KB
-    per call regardless of line length, so on a ~55KB transcript that
-    self-read comes back silently truncated (~93% of the file, no loud
-    error) and the model proceeds to "clean" only what it got. Removing
-    `read` here closes that path outright rather than trying to make the
-    truncated read safe to consume."""
-    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)",
-                GEMINI_MODEL_1)
+    tools is "write" only, NOT "read,write": @attachment already embeds
+    transcript-raw.txt's full content inline in the prompt pi sends the model (confirmed
+    via pi's own session log — the whole file shows up as a <file> block in the first
+    user message, no size cap), so the model never needs to fetch it again. Offering
+    `read` anyway invites a small local model to redundantly re-read a file it already
+    has in full — and pi's `read` tool caps total output at ~50KB per call regardless of
+    line length, so on a ~55KB transcript that self-read comes back silently truncated
+    (~93% of the file) and the model "cleans" only what it got. Removing `read` closes
+    that path outright.
+    """
+    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_MODEL_1)
     run_pi(
-        attachments=[workdir / "transcript-raw.txt"],
-        prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        tools="write",
-        model=GEMINI_MODEL_2,
-        logfile=workdir / "pass0.log",
-        cwd=workdir,
+        attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
+        tools="write", model=GEMINI_MODEL_2, logfile=workdir / "pass0.log", cwd=workdir,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
@@ -541,17 +452,12 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
 
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
     logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
-    # tools="write" only, same reasoning as stage_cleanup: transcript.txt is
-    # already fully inlined via @attachment, and this stage never needs to
-    # open any other file, so `read` would only ever be a redundant,
-    # truncation-prone re-fetch of content the model already has.
+    # tools="write" only, same reasoning as stage_cleanup: transcript.txt is already
+    # fully inlined via @attachment, and this stage never opens any other file, so
+    # `read` would only ever be a redundant, truncation-prone re-fetch.
     run_pi(
-        attachments=[workdir / "transcript.txt"],
-        prompt_file=PROMPTS_DIR / "pass1-extract.md",
-        tools="write",
-        model=GEMINI_MODEL_1,
-        logfile=workdir / "pass1.log",
-        cwd=workdir,
+        attachments=[workdir / "transcript.txt"], prompt_file=PROMPTS_DIR / "pass1-extract.md",
+        tools="write", model=GEMINI_MODEL_1, logfile=workdir / "pass1.log", cwd=workdir,
     )
     _require(workdir / "extract.md", "Pass 1")
     logger.info("  wrote %s", workdir / "extract.md")
@@ -568,17 +474,8 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     if not items:
         raise RuntimeError("No topics/entities found in extract.md")
 
-    batches = [
-        items[i:i + BATCH_SIZE]
-        for i in range(0, len(items), BATCH_SIZE)
-    ]
-
-    logger.info(
-        "  splitting %d items into %d batches of up to %d",
-        len(items),
-        len(batches),
-        BATCH_SIZE,
-    )
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    logger.info("  splitting %d items into %d batches of up to %d", len(items), len(batches), BATCH_SIZE)
 
     base_prompt = (PROMPTS_DIR / "pass2-enrich.md").read_text()
     batch_files = []
@@ -588,95 +485,52 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
         prompt_file = workdir / f"pass2_batch_{idx}_prompt.md"
 
         items_block = "\n".join(f"- {item}" for item in batch)
-        prompt_text = base_prompt.replace("{{ITEMS}}", items_block)
-        prompt_text = prompt_text.replace(
-            "{{OUTPUT_FILE}}",
-            batch_file.name,
-        )
-
+        prompt_text = base_prompt.replace("{{ITEMS}}", items_block).replace("{{OUTPUT_FILE}}", batch_file.name)
         prompt_file.write_text(prompt_text)
 
-        logger.info(
-            "  batch %d/%d: %d items -> %s",
-            idx + 1,
-            len(batches),
-            len(batch),
-            batch_file.name,
-        )
+        logger.info("  batch %d/%d: %d items -> %s", idx + 1, len(batches), len(batch), batch_file.name)
 
         run_pi(
-            attachments=[],
-            prompt_file=prompt_file,
-            tools=None,
-            model=GEMINI_MODEL_2,
-            logfile=workdir / f"pass2_batch_{idx}.log",
-            cwd=workdir,
+            attachments=[], prompt_file=prompt_file, tools=None, model=GEMINI_MODEL_2,
+            logfile=workdir / f"pass2_batch_{idx}.log", cwd=workdir,
         )
 
         logger.info(" Sleeping 1 min... TPM limit ")
         time.sleep(60)
 
-        # Do not proceed until this batch has actually produced
-        # usable output.
-        _require(
-            batch_file,
-            f"Pass 2 batch {idx + 1}/{len(batches)}",
-        )
-
+        _require(batch_file, f"Pass 2 batch {idx + 1}/{len(batches)}")  # don't proceed until usable output exists
         batch_files.append(batch_file)
-
-        logger.info("  batch %d/%d completed successfully",idx + 1,len(batches),)
+        logger.info("  batch %d/%d completed successfully", idx + 1, len(batches))
 
     combined = []
-
     for bf in batch_files:
         content = bf.read_text().strip()
-        if content:
-            combined.append(content)
-        else:
-            raise RuntimeError(
-                f"Pass 2 produced an empty batch file: {bf.name}"
-            )
+        if not content:
+            raise RuntimeError(f"Pass 2 produced an empty batch file: {bf.name}")
+        combined.append(content)
 
     if not combined:
-        raise RuntimeError(
-            "Pass 2 produced no background content in any batch"
-        )
+        raise RuntimeError("Pass 2 produced no background content in any batch")
 
     background_md = workdir / "background.md"
     background_md.write_text("\n\n".join(combined))
-
-    logger.info(
-        "  wrote %s by combining %d validated batch files",
-        background_md,
-        len(batch_files),
-    )
-
+    logger.info("  wrote %s by combining %d validated batch files", background_md, len(batch_files))
     _require(background_md, "Pass 2")
 
 
 def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
     logger.info("[5/7] Pass 3: synthesis into full academic notes (no info dropped)")
     logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of pi)", date_str)
-    # Deliberately NOT attaching transcript.txt here: extract.md's "Speaker's
-    # claims & arguments" section already is a compressed-but-complete,
-    # sentence-by-sentence record of the talk (see pass1-extract.md's
-    # no-ellipsis rule), so re-sending the full transcript on top of it would
-    # just burn tokens for content pi already has.
-    # tools="write" only — same reasoning as stage_cleanup/stage_extract:
-    # both attachments are already fully inlined, and this stage never
-    # needs to open any other file.
+    # Deliberately NOT attaching transcript.txt: extract.md's "Speaker's claims &
+    # arguments" section is already a compressed-but-complete, sentence-by-sentence
+    # record of the talk (see pass1-extract.md's no-ellipsis rule), so re-sending the
+    # full transcript on top would just burn tokens for content pi already has.
+    # tools="write" only — both attachments are already fully inlined, and this stage
+    # never needs to open any other file.
     run_pi(
-        attachments=[
-            workdir / "extract.md",
-            workdir / "background.md",
-        ],
-        prompt_file=PROMPTS_DIR / "pass3-synthesize.md",
-        tools="write",
-        model=GEMINI_MODEL_1,
-        logfile=workdir / "pass3.log",
-        cwd=workdir,
-        substitutions={"{{DATA}}": date_str},
+        attachments=[workdir / "extract.md", workdir / "background.md"],
+        prompt_file=PROMPTS_DIR / "pass3-synthesize.md", tools="write", model=GEMINI_MODEL_1,
+        logfile=workdir / "pass3.log", cwd=workdir, substitutions={"{{DATA}}": date_str},
     )
     _require(workdir / "notes.md", "Pass 3")
     logger.info("  wrote %s", workdir / "notes.md")
@@ -684,32 +538,22 @@ def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> 
 
 def stage_verify(workdir: Path, model_strong: str | None) -> None:
     logger.info("[6/7] Pass 4: verification (flags unsupported claims, deletes nothing)")
-    # extract.md (not transcript.txt) is the ground truth pass4-verify.md
-    # actually checks the speaker's-view sentences against, so it's attached
-    # here instead of the full transcript.
-    # `read` kept here (unlike cleanup/extract/synthesize above): this pass
-    # uses `edit` to annotate notes.md in place, which likely needs to read
-    # current file state to locate exact text to replace — not the same
-    # safe no-op removing `read` is for a pass that only ever writes fresh
-    # output from fully-inlined attachments.
+    # extract.md (not transcript.txt) is the ground truth pass4-verify.md checks the
+    # speaker's-view sentences against, so it's attached here instead of the full
+    # transcript. `read` is kept here (unlike cleanup/extract/synthesize above): this
+    # pass uses `edit` to annotate notes.md in place, which needs to read current file
+    # state to locate exact text to replace — not the same safe no-op that removing
+    # `read` is for a pass that only ever writes fresh output from inlined attachments.
     run_pi(
-        attachments=[
-            workdir / "notes.md",
-            workdir / "extract.md",
-            workdir / "background.md",
-        ],
-        prompt_file=PROMPTS_DIR / "pass4-verify.md",
-        tools="read,write,edit",
-        model=GEMINI_MODEL_1,
-        logfile=workdir / "pass4.log",
-        cwd=workdir,
+        attachments=[workdir / "notes.md", workdir / "extract.md", workdir / "background.md"],
+        prompt_file=PROMPTS_DIR / "pass4-verify.md", tools="read,write,edit", model=GEMINI_MODEL_1,
+        logfile=workdir / "pass4.log", cwd=workdir,
     )
     _require(workdir / "notes.md", "Pass 4")
     logger.info("  updated %s", workdir / "notes.md")
 
 
-# ---------------------------------------------------------------------------
-# PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required)
+# --- PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required) ---------
 PDF_MARGIN = "2cm"
 PDF_FONT_SIZE = "10.5pt"
 PDF_FONT_FAMILY = "Georgia, 'Times New Roman', serif"
@@ -863,98 +707,79 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 def _markdown_to_html(md_text: str) -> str:
     if markdown is None:
         raise RuntimeError("markdown not installed. Run: pip install markdown")
-    md = markdown.Markdown(
-        extensions=[
-            "markdown.extensions.extra",
-            "markdown.extensions.sane_lists",
-            "markdown.extensions.smarty",
-        ]
-    )
+    md = markdown.Markdown(extensions=["markdown.extensions.extra", "markdown.extensions.sane_lists", "markdown.extensions.smarty"])
     return md.convert(md_text)
 
 
 def _text_to_html(text: str, title: str) -> str:
-    """Render plain transcript text as simple justified paragraphs, with a
-    title heading so the PDF header (string-set on h1) picks it up."""
+    """Render plain transcript text as simple justified paragraphs, with a title heading
+    so the PDF header (string-set on h1) picks it up."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
     body = [f"<h1>{html.escape(title)}</h1>"]
     for para in paragraphs:
-        escaped = html.escape(para).replace("\n", "<br>")
-        body.append(f"<p>{escaped}</p>")
+        body.append(f"<p>{html.escape(para).replace(chr(10), '<br>')}</p>")
     return "\n".join(body)
 
 
 def _render_pdf(html_body: str, dest: Path) -> None:
     if weasyprint is None:
         raise RuntimeError(
-            f"weasyprint could not be imported ({WEASYPRINT_IMPORT_ERROR}). "
-            f"This is almost always a native-library path issue, not a missing pip "
-            f"install — see check_environment()'s message at startup for the fix."
+            f"weasyprint could not be imported ({WEASYPRINT_IMPORT_ERROR}). This is almost always a "
+            f"native-library path issue, not a missing pip install — see check_environment()'s message "
+            f"at startup for the fix."
         )
     css = PDF_CSS.format(margin=PDF_MARGIN, font_size=PDF_FONT_SIZE, font_family=PDF_FONT_FAMILY)
-    full_html = HTML_TEMPLATE.format(css=css, body=html_body)
-    weasyprint.HTML(string=full_html).write_pdf(str(dest))
+    weasyprint.HTML(string=HTML_TEMPLATE.format(css=css, body=html_body)).write_pdf(str(dest))
     logger.info("  wrote %s", dest)
 
 
 def _render_html(html_body: str, dest: Path) -> None:
-    """Write a standalone, self-contained HTML file (same CSS/layout as the
-    PDF, just without WeasyPrint's page-specific @page rules mattering)."""
+    """Write a standalone, self-contained HTML file (same CSS/layout as the PDF, just
+    without WeasyPrint's page-specific @page rules mattering)."""
     css = PDF_CSS.format(margin=PDF_MARGIN, font_size=PDF_FONT_SIZE, font_family=PDF_FONT_FAMILY)
-    full_html = HTML_TEMPLATE.format(css=css, body=html_body)
-    dest.write_text(full_html, encoding="utf-8")
+    dest.write_text(HTML_TEMPLATE.format(css=css, body=html_body), encoding="utf-8")
     logger.info("  wrote %s", dest)
 
 
 def stage_pdf(workdir: Path, run_name: str) -> None:
     logger.info("[7/7] Rendering PDF/HTML outputs (WeasyPrint)")
 
-    notes_md = (workdir / "notes.md").read_text()
-    notes_html_body = _markdown_to_html(notes_md)
+    notes_html_body = _markdown_to_html((workdir / "notes.md").read_text())
     _render_pdf(notes_html_body, workdir / "notes.pdf")
     _render_html(notes_html_body, workdir / "notes.html")
 
     transcript_text = (workdir / "transcript.txt").read_text()
     _render_pdf(_text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf")
 
-    notes_md_dest = OUTPUT_DIR / f"{run_name}-notes.md"
-    notes_pdf_dest = OUTPUT_DIR / f"{run_name}-notes.pdf"
-    notes_html_dest = OUTPUT_DIR / f"{run_name}-notes.html"
-    transcript_pdf_dest = OUTPUT_DIR / f"{run_name}-transcript.pdf"
-    shutil.copy2(workdir / "notes.md", notes_md_dest)
-    shutil.copy2(workdir / "notes.pdf", notes_pdf_dest)
-    shutil.copy2(workdir / "notes.html", notes_html_dest)
-    shutil.copy2(workdir / "transcript.pdf", transcript_pdf_dest)
+    dests = {
+        "notes.md": OUTPUT_DIR / f"{run_name}-notes.md",
+        "notes.pdf": OUTPUT_DIR / f"{run_name}-notes.pdf",
+        "notes.html": OUTPUT_DIR / f"{run_name}-notes.html",
+        "transcript.pdf": OUTPUT_DIR / f"{run_name}-transcript.pdf",
+    }
+    for src_name, dest in dests.items():
+        shutil.copy2(workdir / src_name, dest)
     logger.info("  copied 4 output files to %s", OUTPUT_DIR)
-    logger.info("    %s", notes_md_dest)
-    logger.info("    %s", notes_pdf_dest)
-    logger.info("    %s", notes_html_dest)
-    logger.info("    %s", transcript_pdf_dest)
+    for dest in dests.values():
+        logger.info("    %s", dest)
 
 
 def _require(path: Path, stage_name: str) -> None:
     if not path.exists() or not path.read_text().strip():
-        raise RuntimeError(
-            f"{stage_name} did not produce {path.name} — check the matching "
-            f"pass log in {path.parent} before continuing."
-        )
-    # Belt-and-suspenders: whatever pi/the model actually wrote, make sure
-    # it doesn't contain a line pi itself can't fully read back in a later
-    # stage. See ensure_no_long_lines() for why this can't be guaranteed
-    # just by prompt instructions alone.
+        raise RuntimeError(f"{stage_name} did not produce {path.name} — check the matching pass log in {path.parent} before continuing.")
+    # Belt-and-suspenders: whatever pi/the model wrote, make sure it doesn't contain a
+    # line pi itself can't fully read back in a later stage (see ensure_no_long_lines()
+    # for why this can't be guaranteed by prompt instructions alone).
     ensure_no_long_lines(path)
 
 
 def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
-    """When resuming with --from-stage, fail fast with a clear message if
-    the files that stage depends on aren't already in workdir, instead of
-    letting pi run against a missing @attachment."""
+    """When resuming with --from-stage, fail fast with a clear message if the files that
+    stage depends on aren't already in workdir, instead of letting pi run against a
+    missing @attachment."""
     missing = [f for f in STAGE_REQUIRES.get(from_stage, []) if not (workdir / f).exists()]
     if missing:
-        raise RuntimeError(
-            f"--from-stage {from_stage} requires {', '.join(missing)} to already "
-            f"exist in {workdir}, but they don't. Run from an earlier stage first."
-        )
+        raise RuntimeError(f"--from-stage {from_stage} requires {', '.join(missing)} to already exist in {workdir}, but they don't. Run from an earlier stage first.")
 
 
 def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None:
@@ -1012,9 +837,9 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
 
 
 def check_environment() -> None:
-    """Ensure the working folders exist, and fail fast with a clear message
-    if a required binary/package is missing — rather than discovering it
-    after transcribing a 1-hour recording."""
+    """Ensure the working folders exist, and fail fast with a clear message if a
+    required binary/package is missing — rather than discovering it after transcribing a
+    1-hour recording."""
     for path in (INPUT_DIR, OUTPUT_DIR, LOG_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -1024,28 +849,20 @@ def check_environment() -> None:
 
     if weasyprint is None:
         problems.append(
-            "weasyprint could not be loaded "
-            f"({WEASYPRINT_IMPORT_ERROR}). On macOS this is almost always "
-            "WeasyPrint failing to find its native libraries (pango/cairo/"
-            "gdk-pixbuf) installed via Homebrew, not a missing `pip install`. Fix:\n"
+            f"weasyprint could not be loaded ({WEASYPRINT_IMPORT_ERROR}). On macOS this is almost always "
+            "WeasyPrint failing to find its native libraries (pango/cairo/gdk-pixbuf) installed via "
+            "Homebrew, not a missing `pip install`. Fix:\n"
             "      brew install cairo pango gdk-pixbuf libffi\n"
             "      export DYLD_FALLBACK_LIBRARY_PATH=\"$(brew --prefix)/lib:$DYLD_FALLBACK_LIBRARY_PATH\"\n"
-            "    Add that export to your ~/.zshrc so it's set for every future run. "
-            "Full troubleshooting: "
+            "    Add that export to your ~/.zshrc so it's set for every future run. Full troubleshooting: "
             "https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#troubleshooting"
         )
     if markdown is None:
         problems.append("`markdown` not installed — required to render notes.md. Run: pip install markdown")
     if mlx_whisper is None:
-        problems.append(
-            "mlx-whisper isn't installed — it's the only transcription "
-            "backend now. Run: pip install mlx-whisper"
-        )
+        problems.append("mlx-whisper isn't installed — it's the only transcription backend now. Run: pip install mlx-whisper")
     elif shutil.which("ffmpeg") is None:
-        problems.append(
-            "`ffmpeg` not found on PATH — mlx-whisper needs it to decode audio. "
-            "Run: brew install ffmpeg"
-        )
+        problems.append("`ffmpeg` not found on PATH — mlx-whisper needs it to decode audio. Run: brew install ffmpeg")
 
     if problems:
         print("Setup problem(s) found before starting:")
@@ -1056,20 +873,16 @@ def check_environment() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--file", type=Path, default=None,
-                        help="Process a single audio file instead of scanning INPUT_DIR")
-    parser.add_argument("--model-fast", default=os.environ.get("PI_MODEL_FAST"),
-                        help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
-                             f"Does NOT affect cleanup (pass 0), which is always forced to "
-                             f"the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.")
-    parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"),
-                        help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
-    parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT,
-                        help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
-    parser.add_argument("--from-stage", choices=STAGES, default="transcribe",
-                        help="Resume from this stage (requires --file; reuses existing intermediate files)")
-    parser.add_argument("--keep-input", action="store_true",
-                        help="Don't move processed files into INPUT_DIR/processed/")
+    parser.add_argument("--file", type=Path, default=None, help="Process a single audio file instead of scanning INPUT_DIR")
+    parser.add_argument(
+        "--model-fast", default=os.environ.get("PI_MODEL_FAST"),
+        help=f"Model for extract/enrich passes (env: PI_MODEL_FAST). Does NOT affect cleanup (pass 0), "
+             f"which is always forced to the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.",
+    )
+    parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"), help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
+    parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT, help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
+    parser.add_argument("--from-stage", choices=STAGES, default="transcribe", help="Resume from this stage (requires --file; reuses existing intermediate files)")
+    parser.add_argument("--keep-input", action="store_true", help="Don't move processed files into INPUT_DIR/processed/")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print debug-level logs to console")
     args = parser.parse_args()
 
@@ -1091,7 +904,6 @@ def main() -> None:
 
     # Batch mode: scan INPUT_DIR, process one file at a time.
     audio_files = discover_audio_files(INPUT_DIR)
-
     if not audio_files:
         print(f"No audio files found in {INPUT_DIR}")
         return
