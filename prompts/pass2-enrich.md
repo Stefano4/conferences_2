@@ -4,7 +4,7 @@ and write `{{OUTPUT_FILE}}` in Italian — paraphrase every finding in Italian
 even when the source itself (e.g., an arXiv abstract) is in English.
 
 Your ONLY job is to gather background information for the topics/entities listed below. 
-You must NOT rely on your own training knowledge for facts — every fact you
+You must NOT rely only on your own training knowledge for facts: every fact you
 write down must come from a response you actually fetched in this session.
 No API keys are available or needed — every source below is free/open.
 

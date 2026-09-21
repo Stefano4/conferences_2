@@ -47,7 +47,6 @@ Usage:
     python conf_notes.py -v                   # debug-level console logging
 """
 
-
 from __future__ import annotations
 import argparse
 import html
@@ -59,6 +58,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -119,8 +119,11 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 # never leaves the machine and doesn't spend cloud-model budget on a pass
 # that doesn't need a strong model. See stage_cleanup() below, which passes
 # this constant to pi regardless of what --model-fast is set to.
-GEMINI_MODEL_1 = "gemini-flash-lite-latest" #"gemma4:e4b-mlx"
+GEMINI_MODEL_1 = "gemini-flash-lite-latest"  # "gemma4:e4b-mlx"
+GEMINI_MODEL_2 = "gemini-3.1-flash-lite"  # "gemma4:e4b-mlx"
 LOCAL_MODEL = "gemma4:e4b-mlx"
+PI_TIMEOUT_SECONDS = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
+BATCH_SIZE = 80
 
 # Files each stage needs already present when resuming with --from-stage
 # (irrelevant for a normal full run, where the prior stage just wrote them).
@@ -141,7 +144,7 @@ STAGE_REQUIRES = {
 }
 
 _ITALIAN_MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
-                    "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+                   "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
 
 # Date patterns to look for in a recording's filename, tried in order.
 # Each tuple is (regex, group order). Deliberately conservative (requires
@@ -158,6 +161,7 @@ def _format_italian_date(y: int, m: int, d: int) -> str | None:
     if 1 <= m <= 12 and 1 <= d <= 31 and 2000 <= y <= 2100:
         return f"{d} {_ITALIAN_MONTHS[m - 1]} {y}"
     return None
+
 
 def _parse_extract_items(extract_path: Path) -> list[str]:
     """Return every topic/entity listed under 'Topics & concepts mentioned'
@@ -177,6 +181,7 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
             if stripped.startswith("- "):
                 items.append(stripped[2:].strip())
     return items
+
 
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
@@ -295,14 +300,14 @@ def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) 
 
 
 def run_pi(
-    *,
-    attachments: list[Path],
-    prompt_file: Path,
-    tools: str | None,
-    model: str | None,
-    logfile: Path,
-    cwd: Path,
-    substitutions: dict[str, str] | None = None,
+        *,
+        attachments: list[Path],
+        prompt_file: Path,
+        tools: str | None,
+        model: str | None,
+        logfile: Path,
+        cwd: Path,
+        substitutions: dict[str, str] | None = None,
 ) -> None:
     """Invoke pi non-interactively: pi -p @file1 @file2 "<prompt>" --tools ...
 
@@ -325,6 +330,7 @@ def run_pi(
     cmd = ["pi", "-p"]
     cmd += [f"@{p}" for p in attachments]
     cmd += [prompt_text]
+    cmd += [" --no-notify "]
     if tools:
         cmd += ["--tools", tools]
     if model:
@@ -379,6 +385,7 @@ def run_pi(
     # independent of whatever else might still be holding the pipe.
     buf = b""
     with open(logfile, "w") as lf:
+        started = time.monotonic()
         while True:
             ready, _, _ = select.select([proc.stdout], [], [], 0.5)
             if ready:
@@ -398,6 +405,27 @@ def run_pi(
             # is a leftover grandchild, not pi, so stop waiting on it.
             if proc.poll() is not None:
                 break
+
+            elapsed = time.monotonic() - started
+            if elapsed >= PI_TIMEOUT_SECONDS:
+                logger.error(
+                    "pi timed out after %.0f seconds; aborting pipeline",
+                    elapsed,
+                )
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                raise TimeoutError(
+                    f"pi exceeded the hard timeout of {PI_TIMEOUT_SECONDS}s"
+                )
         if buf:
             line = buf.decode("utf-8", errors="replace")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -438,10 +466,10 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
 
     if _whisper_model_is_cached(whisper_model):
         logger.debug("  Whisper model %s found in cache (%s) — no download needed",
-                      whisper_model, os.environ.get("HF_HOME"))
+                     whisper_model, os.environ.get("HF_HOME"))
     else:
         logger.info("  Whisper model %s not in cache (%s) — downloading once, "
-                     "will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
+                    "will be cached for future runs", whisper_model, os.environ.get("HF_HOME"))
 
     result = mlx_whisper.transcribe(str(audio), path_or_hf_repo=whisper_model)
 
@@ -503,7 +531,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
         attachments=[workdir / "transcript-raw.txt"],
         prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
         tools="write",
-        model=GEMINI_MODEL_1,
+        model=GEMINI_MODEL_2,
         logfile=workdir / "pass0.log",
         cwd=workdir,
     )
@@ -531,6 +559,7 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     logger.info("[4/7] Pass 2: multi-source enrichment (batched)")
+
     extract_path = workdir / "extract.md"
     if not extract_path.exists():
         raise RuntimeError("extract.md not found — cannot run enrichment")
@@ -539,13 +568,20 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     if not items:
         raise RuntimeError("No topics/entities found in extract.md")
 
-    BATCH_SIZE = 8  # tweak as needed
-    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
-    logger.info("  splitting %d items into %d batches of up to %d",
-                len(items), len(batches), BATCH_SIZE)
+    batches = [
+        items[i:i + BATCH_SIZE]
+        for i in range(0, len(items), BATCH_SIZE)
+    ]
 
-    batch_files = []
+    logger.info(
+        "  splitting %d items into %d batches of up to %d",
+        len(items),
+        len(batches),
+        BATCH_SIZE,
+    )
+
     base_prompt = (PROMPTS_DIR / "pass2-enrich.md").read_text()
+    batch_files = []
 
     for idx, batch in enumerate(batches):
         batch_file = workdir / f"background_batch_{idx}.md"
@@ -553,38 +589,68 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
         items_block = "\n".join(f"- {item}" for item in batch)
         prompt_text = base_prompt.replace("{{ITEMS}}", items_block)
-        prompt_text = prompt_text.replace("{{OUTPUT_FILE}}", batch_file.name)
+        prompt_text = prompt_text.replace(
+            "{{OUTPUT_FILE}}",
+            batch_file.name,
+        )
+
         prompt_file.write_text(prompt_text)
 
-        logger.info("  batch %d/%d: %d items -> %s",
-                    idx + 1, len(batches), len(batch), batch_file.name)
+        logger.info(
+            "  batch %d/%d: %d items -> %s",
+            idx + 1,
+            len(batches),
+            len(batch),
+            batch_file.name,
+        )
 
         run_pi(
-            attachments=[],                     # no attachment needed
+            attachments=[],
             prompt_file=prompt_file,
             tools=None,
-            model=LOCAL_MODEL,
+            model=GEMINI_MODEL_2,
             logfile=workdir / f"pass2_batch_{idx}.log",
             cwd=workdir,
         )
+
+        logger.info(" Sleeping 1 min... TPM limit ")
+        time.sleep(60)
+
+        # Do not proceed until this batch has actually produced
+        # usable output.
+        _require(
+            batch_file,
+            f"Pass 2 batch {idx + 1}/{len(batches)}",
+        )
+
         batch_files.append(batch_file)
 
-    # Combine all batch outputs into background.md
+        logger.info("  batch %d/%d completed successfully",idx + 1,len(batches),)
+
     combined = []
+
     for bf in batch_files:
-        if bf.exists():
-            content = bf.read_text().strip()
-            if content:
-                combined.append(content)
+        content = bf.read_text().strip()
+        if content:
+            combined.append(content)
         else:
-            logger.warning("  batch file %s was not created", bf.name)
+            raise RuntimeError(
+                f"Pass 2 produced an empty batch file: {bf.name}"
+            )
 
     if not combined:
-        raise RuntimeError("Pass 2 produced no background content in any batch")
+        raise RuntimeError(
+            "Pass 2 produced no background content in any batch"
+        )
 
     background_md = workdir / "background.md"
     background_md.write_text("\n\n".join(combined))
-    logger.info("  wrote %s by combining %d batch files", background_md, len(batch_files))
+
+    logger.info(
+        "  wrote %s by combining %d validated batch files",
+        background_md,
+        len(batch_files),
+    )
 
     _require(background_md, "Pass 2")
 
@@ -911,12 +977,16 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
         stage_transcribe(audio, workdir, args.whisper_model)
     if start <= STAGES.index("cleanup"):
         stage_cleanup(workdir, args.model_fast)
+        logger.info(" Sleeping 1 min... TPM limit ")
+        time.sleep(60)
     if start <= STAGES.index("extract"):
         stage_extract(workdir, args.model_fast)
     if start <= STAGES.index("enrich"):
         stage_enrich(workdir, args.model_fast)
     if start <= STAGES.index("synthesize"):
         stage_synthesize(workdir, args.model_strong, derive_date_from_filename(audio))
+        logger.info(" Sleeping 1 min... TPM limit ")
+        time.sleep(60)
     if start <= STAGES.index("verify"):
         stage_verify(workdir, args.model_strong)
     if start <= STAGES.index("pdf"):
@@ -987,19 +1057,19 @@ def check_environment() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", type=Path, default=None,
-                         help="Process a single audio file instead of scanning INPUT_DIR")
+                        help="Process a single audio file instead of scanning INPUT_DIR")
     parser.add_argument("--model-fast", default=os.environ.get("PI_MODEL_FAST"),
                         help="Model for extract/enrich passes (env: PI_MODEL_FAST). "
-                              f"Does NOT affect cleanup (pass 0), which is always forced to "
-                              f"the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.")
+                             f"Does NOT affect cleanup (pass 0), which is always forced to "
+                             f"the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.")
     parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"),
-                         help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
+                        help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT,
-                         help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
+                        help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
     parser.add_argument("--from-stage", choices=STAGES, default="transcribe",
-                         help="Resume from this stage (requires --file; reuses existing intermediate files)")
+                        help="Resume from this stage (requires --file; reuses existing intermediate files)")
     parser.add_argument("--keep-input", action="store_true",
-                         help="Don't move processed files into INPUT_DIR/processed/")
+                        help="Don't move processed files into INPUT_DIR/processed/")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print debug-level logs to console")
     args = parser.parse_args()
 
@@ -1031,6 +1101,9 @@ def main() -> None:
     for audio in audio_files:
         try:
             process_file(audio, args, "transcribe")
+        except TimeoutError as e:
+            logger.error("FATAL: %s", e)
+            raise
         except Exception as e:
             logger.error("Failed on %s: %s", audio.name, e)
             failures.append(audio.name)
