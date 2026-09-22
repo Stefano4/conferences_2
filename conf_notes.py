@@ -96,8 +96,19 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 GEMINI_MODEL_1 = "gemini-flash-lite-latest"  # "gemma4:e4b-mlx"
 GEMINI_MODEL_2 = "gemini-3.1-flash-lite"     # "gemma4:e4b-mlx"
 LOCAL_MODEL = "gemma4:e4b-mlx"
+LOCAL_MODEL_2 = "gemma4:e4b-mlx"
 PI_TIMEOUT_SECONDS = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
-BATCH_SIZE = 80
+# Pass 2 (enrich) model. Swap this to LOCAL_MODEL to run fully offline. stage_enrich()
+# reads this constant and adjusts itself automatically:
+#   - batch size drops to ENRICH_BATCH_SIZE_LOCAL (one item per pi call) instead of
+#     BATCH_SIZE, since a local model's context window can't hold a cloud model's worth
+#     of web-search results for 80 items at once — that's what was overflowing before.
+#   - the per-call outputs go into workdir/enrich/ (one small .md per item/batch) instead
+#     of loose background_batch_N.md files, since there can now be many more of them.
+#   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
+ENRICH_MODEL = GEMINI_MODEL_2   # LOCAL_MODEL GEMINI_MODEL_2
+BATCH_SIZE = 800             # items per pi call when ENRICH_MODEL is a cloud model
+ENRICH_BATCH_SIZE_LOCAL = 1  # items per pi call when ENRICH_MODEL is LOCAL_MODEL
 
 # Files each stage needs already present when resuming with --from-stage (irrelevant for
 # a normal full run, where the prior stage just wrote them).
@@ -278,11 +289,13 @@ def run_pi(
     for key, value in (substitutions or {}).items():
         prompt_text = prompt_text.replace(key, value)
 
-    cmd = ["pi", "-p"] + [f"@{p}" for p in attachments] + [prompt_text, " --no-notify "]
+    cmd = ["pi", "-p"] + [f"@{p}" for p in attachments] + [prompt_text, " "] #--no-notify "]
     if tools:
         cmd += ["--tools", tools]
     if model:
         cmd += ["--model", model]
+    if model in (GEMINI_MODEL_2, LOCAL_MODEL_2):
+        cmd += ["--thinking", "minimal"]
     # Extra flags for pi itself (e.g. a debug flag printing which provider/model in
     # provider-fallback.json actually served each request). Varies by pi version/config,
     # so it's an opt-in env var: export PI_EXTRA_ARGS="--log-level debug"
@@ -444,7 +457,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_MODEL_1)
     run_pi(
         attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        tools="write", model=GEMINI_MODEL_2, logfile=workdir / "pass0.log", cwd=workdir,
+        tools="write", model=GEMINI_MODEL_1, logfile=workdir / "pass0.log", cwd=workdir,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
@@ -464,7 +477,18 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
-    logger.info("[4/7] Pass 2: multi-source enrichment (batched)")
+    """Pass 2: look up each extracted topic/entity and write a short background note
+    for it. Batch size adapts to ENRICH_MODEL (see its comment above): a cloud model
+    gets BATCH_SIZE items per pi call, a local model gets ENRICH_BATCH_SIZE_LOCAL (1),
+    each call's own web-search results otherwise blow past a local context window.
+
+    Per-call outputs (one .md per batch, or per item when local) live in their own
+    workdir/enrich/ subfolder so a many-batches local run doesn't clutter workdir with
+    hundreds of loose files; they're merged into background.md at the end either way.
+    """
+    is_local = ENRICH_MODEL == LOCAL_MODEL
+    batch_size = ENRICH_BATCH_SIZE_LOCAL if is_local else BATCH_SIZE
+    logger.info("[4/7] Pass 2: multi-source enrichment (batched, model=%s, batch_size=%d)", ENRICH_MODEL, batch_size)
 
     extract_path = workdir / "extract.md"
     if not extract_path.exists():
@@ -474,29 +498,36 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     if not items:
         raise RuntimeError("No topics/entities found in extract.md")
 
-    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
-    logger.info("  splitting %d items into %d batches of up to %d", len(items), len(batches), BATCH_SIZE)
+    batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+    logger.info("  splitting %d items into %d batches of up to %d", len(items), len(batches), batch_size)
+
+    enrich_dir = workdir / "enrich"
+    enrich_dir.mkdir(exist_ok=True)
 
     base_prompt = (PROMPTS_DIR / "pass2-enrich.md").read_text()
     batch_files = []
 
     for idx, batch in enumerate(batches):
-        batch_file = workdir / f"background_batch_{idx}.md"
-        prompt_file = workdir / f"pass2_batch_{idx}_prompt.md"
+        batch_file = enrich_dir / f"item_{idx:04d}.md"
+        prompt_file = enrich_dir / f"item_{idx:04d}_prompt.md"
 
         items_block = "\n".join(f"- {item}" for item in batch)
         prompt_text = base_prompt.replace("{{ITEMS}}", items_block).replace("{{OUTPUT_FILE}}", batch_file.name)
         prompt_file.write_text(prompt_text)
 
-        logger.info("  batch %d/%d: %d items -> %s", idx + 1, len(batches), len(batch), batch_file.name)
+        label = batch[0] if batch_size == 1 else f"{len(batch)} items"
+        logger.info("  batch %d/%d: %s -> %s", idx + 1, len(batches), label, batch_file.name)
 
+        # cwd=enrich_dir (not workdir) so pi's relative "write to {{OUTPUT_FILE}}"
+        # lands batch_file.name inside enrich/, matching where batch_file actually is.
         run_pi(
-            attachments=[], prompt_file=prompt_file, tools=None, model=GEMINI_MODEL_2,
-            logfile=workdir / f"pass2_batch_{idx}.log", cwd=workdir,
+            attachments=[], prompt_file=prompt_file, tools=None, model=ENRICH_MODEL,
+            logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir, 
         )
 
-        logger.info(" Sleeping 1 min... TPM limit ")
-        time.sleep(60)
+        if not is_local:  # local pi calls don't hit a cloud TPM limit, so no need to wait
+            logger.info(" Sleeping 1 min... TPM limit ")
+            time.sleep(60)
 
         _require(batch_file, f"Pass 2 batch {idx + 1}/{len(batches)}")  # don't proceed until usable output exists
         batch_files.append(batch_file)

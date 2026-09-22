@@ -30,10 +30,6 @@ Rewrite `notes.md` in place:
 - Leave supported sentences exactly as they are.
 - For unsupported sentences, keep the sentence but append inline:
   "**[non verificato]**". Do not delete or shorten it.
-- Add a final `## Note di verifica` section listing every sentence you
-  flagged (both unsupported and truncated) and a one-line reason, so the
-  reader can see exactly what wasn't traceable to a source or was
-  recovered/left incomplete.
 
 Do not add any new facts while doing this pass beyond recovering
 truncated passages from extract.md as described above, and do not

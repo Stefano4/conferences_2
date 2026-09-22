@@ -62,6 +62,8 @@ If the speaker's sentence is long, rambling, repetitive, or contains
 ONLY for the very first and last sentence, if the speaker is clearly talking 
 about something totally out of topic, before the real conference starts or 
 after it has clearly eneded, you can drop that sentence.
+- Use Bold, italics, and underlining text as a skilled academic PhD student 
+to make the notes more readable
 
 ## Riferimenti
 Numbered list of every source URL used in background.md.
