@@ -56,6 +56,9 @@ list, enriched with extra info added from background.md, as flowing
 academic prose, nothing left out but remove sources (Wikipedia / Wiktionary
 / arXiv / DuckDuckGo) and the related URLs. Organize each sentence using
 sections, this is very important to do.
+This section must carry the same information as the extract.md 
+"Speaker's claims & arguments" section:  rewritten, enriched, cleaned up,
+reorganized but not filtered down.
 If the speaker's sentence is long, rambling, repetitive, or contains
   false starts and filler, still keep it: you can compress a little,
   tidy up, but do not cut any information.

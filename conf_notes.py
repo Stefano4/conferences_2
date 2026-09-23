@@ -5,19 +5,26 @@ turns each into a transcript PDF, a notes markdown file, a notes HTML file, and 
 PDF (4 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API key needed). The
-raw transcript is first lightly cleaned up by pi (forced onto a local model — see
+raw transcript is first lightly cleaned up by opencode (forced onto a local model — see
 GEMINI_MODEL_2 — so this pass stays fully offline too), then that cleaned transcript
-feeds a 4-pass pi pipeline:
+feeds a 4-pass opencode pipeline:
   0. cleanup     — de-dupe/de-hallucinate raw whisper output, drop filler repeats, fix
                    obvious typos. No content removed, nothing paraphrased.
   1. extract     — pull claims/topics/quotes from the cleaned transcript only.
-  2. enrich      — look up each topic across free, no-key sources.
+  2. enrich      — look up each topic across free, no-key sources (opencode's hosted
+                   websearch tool — see run_opencode()'s OPENCODE_ENABLE_EXA note).
   3. synthesize  — combine into full academic notes, nothing dropped.
   4. verify      — flag (never delete) anything not traceable to a source.
 
 Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — passes 2-4
 work from extract.md/background.md/notes.md, which already contain everything they need,
-so the (much longer) transcript isn't re-sent to pi on every later pass.
+so the (much longer) transcript isn't re-sent to opencode on every later pass.
+
+Tool access per pass is controlled by one of three custom opencode agents this script
+defines and injects via OPENCODE_CONFIG_CONTENT on every call (see OPENCODE_AGENTS below)
+— opencode's permission model gates `write` and `edit` behind the same "edit" permission
+key, so a pi-style write-only tool restriction isn't expressible; "notes-writer" (edit
+only) is the closest equivalent.
 
 Folder layout (created automatically next to the script if missing):
   input/   — drop recordings here; processed files move to input/processed/ so reruns
@@ -28,7 +35,9 @@ Folder layout (created automatically next to the script if missing):
 Requirements:
     pip install mlx-whisper weasyprint markdown
     brew install cairo pango gdk-pixbuf libffi ffmpeg   # WeasyPrint + mlx-whisper native deps
-    pi CLI already installed and configured with your provider fallbacks
+    opencode CLI already installed and authenticated (`opencode auth login`) for whichever
+    providers GEMINI_MODEL_1/2 below resolve to. Run `opencode models` to confirm the exact
+    provider/model strings your account has — the ones baked in below are a starting guess.
 
 macOS note: if WeasyPrint fails to import with a library-loading error, Homebrew's libs
 usually just aren't on the dynamic linker's search path — see check_environment()'s error
@@ -42,7 +51,7 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, html, logging, os, re, select, shutil, signal, subprocess, sys, time
+import argparse, html, json, logging, os, re, select, shutil, signal, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
@@ -89,26 +98,32 @@ STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", 
 WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
 
+# opencode model IDs are always "provider/model" (run `opencode models` to see the exact
+# strings your authenticated providers expose). "google" below assumes you've run
+# `opencode auth login` for Gemini/Google AI Studio, and "ollama" assumes a local Ollama
+# server serving the tag after the slash — adjust both prefixes to match your setup.
+#
 # Pass 0 (cleanup) is light, mechanical work (de-dupe/de-hallucinate/typo-fix, no real
 # reasoning about content) so it's forced onto a local model instead of --model-fast —
 # it never leaves the machine and doesn't spend cloud-model budget on a pass that
 # doesn't need a strong model. See stage_cleanup(), which always passes this model.
-GEMINI_MODEL_1 = "gemini-flash-lite-latest"  # "gemma4:e4b-mlx"
-GEMINI_MODEL_2 = "gemini-3.1-flash-lite"     # "gemma4:e4b-mlx"
-LOCAL_MODEL = "gemma4:e4b-mlx"
-LOCAL_MODEL_2 = "gemma4:e4b-mlx"
-PI_TIMEOUT_SECONDS = int(os.environ.get("PI_TIMEOUT_SECONDS", "1800"))
+GEMINI_LATEST = "google/gemini-flash-lite-latest"
+GEMINI_LATEST_LOW = "google/gemini-flash-lite-latest#low"
+GEMINI_31_LOW = "google/gemini-3.1-flash-lite#low"
+LOCAL_MODEL = "ollama/gemma4:e4b-mlx"
+LOCAL_MODEL_2 = "ollama/gemma4:e4b-mlx"
+OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"))
 # Pass 2 (enrich) model. Swap this to LOCAL_MODEL to run fully offline. stage_enrich()
 # reads this constant and adjusts itself automatically:
-#   - batch size drops to ENRICH_BATCH_SIZE_LOCAL (one item per pi call) instead of
+#   - batch size drops to ENRICH_BATCH_SIZE_LOCAL (one item per opencode call) instead of
 #     BATCH_SIZE, since a local model's context window can't hold a cloud model's worth
 #     of web-search results for 80 items at once — that's what was overflowing before.
 #   - the per-call outputs go into workdir/enrich/ (one small .md per item/batch) instead
 #     of loose background_batch_N.md files, since there can now be many more of them.
 #   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
-ENRICH_MODEL = GEMINI_MODEL_2   # LOCAL_MODEL GEMINI_MODEL_2
-BATCH_SIZE = 800             # items per pi call when ENRICH_MODEL is a cloud model
-ENRICH_BATCH_SIZE_LOCAL = 1  # items per pi call when ENRICH_MODEL is LOCAL_MODEL
+ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
+BATCH_SIZE = 10             # items per opencode call when ENRICH_MODEL is a cloud model
+ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
 
 # Files each stage needs already present when resuming with --from-stage (irrelevant for
 # a normal full run, where the prior stage just wrote them).
@@ -116,8 +131,8 @@ ENRICH_BATCH_SIZE_LOCAL = 1  # items per pi call when ENRICH_MODEL is LOCAL_MODE
 # Only "cleanup" and "extract" need the (raw/cleaned) transcript text. From "synthesize"
 # onward, extract.md's "Speaker's claims & arguments" section is already a
 # compressed-but-complete sentence-by-sentence record of the talk, so the full transcript
-# isn't re-attached to later pi calls (it's long, and re-sending it burns tokens for no
-# extra information pi doesn't already have via extract.md).
+# isn't re-attached to later opencode calls (it's long, and re-sending it burns tokens for
+# no extra information opencode doesn't already have via extract.md).
 STAGE_REQUIRES = {
     "cleanup": ["transcript-raw.txt"],
     "extract": ["transcript.txt"],
@@ -164,14 +179,34 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
                 items.append(stripped[2:].strip())
     return items
 
+AGENT_PROFILES = {
+    "notes-writer": {
+        "description": "Writes fresh pipeline output files. No read, no bash, no web.",
+        "mode": "primary",
+        "permissions": {"edit": "allow", "read": "deny", "bash": "deny", "webfetch": "deny", "websearch": "deny", "todowrite": "deny"},
+        "system": "You are a precise writing assistant. Produce only the requested output file, using the content supplied in the message. Do not invent or paraphrase content."
+    },
+    "notes-editor": {
+        "description": "Edits an existing file in place. Read + edit only, no bash, no web.",
+        "mode": "primary",
+        "permissions": {"edit": "allow", "read": "allow", "bash": "deny", "webfetch": "deny", "websearch": "deny", "todowrite": "deny"},
+        "system": "You are a careful editor. Read the file you are asked to edit, then apply only the requested annotations or corrections. Do not remove content."
+    },
+    "notes-enrich": {
+        "description": "Looks up a topic on the web and writes a short background note.",
+        "mode": "primary",
+        "permissions": {"edit": "allow", "read": "allow", "bash": "deny", "webfetch": "allow", "websearch": "allow", "todowrite": "deny"},
+        "system": "You are a research assistant. For each topic listed, search the web for reliable background information and write a concise note. Cite sources where possible."
+    },
+}
 
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
 
-    The speaker rarely states the date out loud, so asking pi to find it in the
+    The speaker rarely states the date out loud, so asking opencode to find it in the
     transcript fails most of the time (extract.md's Session metadata usually says "not
-    stated"). We derive it ourselves and hand it to pi as a fixed value instead of a
-    lookup task it would likely get wrong.
+    stated"). We derive it ourselves and hand it to opencode as a fixed value instead of
+    a lookup task it would likely get wrong.
 
     Tries common date patterns in the filename first (recordings are typically named by
     whoever made them, e.g. "2026-03-05_convegno.m4a"), then falls back to the file's
@@ -224,25 +259,28 @@ def discover_audio_files(input_dir: Path) -> list[Path]:
     return sorted(files, key=lambda p: p.name)
 
 
-# Pi's `read` tool truncates (silently, per line) at roughly this many bytes — see
-# run_pi()'s docstring. Kept as its own constant since it's a property of pi's read
-# tool, not of how we invoke pi.
-PI_READ_LINE_LIMIT_BYTES = 50_000
+# Ported from pi's `read` tool, which silently truncated per line at roughly this many
+# bytes. opencode's docs (https://opencode.ai/docs/tools) don't publish an equivalent
+# per-line cap for its own `read` tool, so this is kept as a cheap, harmless safety net
+# rather than a confirmed opencode limit — verify against the docs above if pass 4
+# (verify, the only pass still using opencode's `read` tool) ever seems to see a
+# truncated notes.md/extract.md/background.md.
+OPENCODE_READ_LINE_LIMIT_BYTES = 50_000
 
 
-def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) -> None:
+def ensure_no_long_lines(path: Path, max_bytes: int = OPENCODE_READ_LINE_LIMIT_BYTES) -> None:
     """Safety net: insert line breaks at whitespace so no line in `path` exceeds
     max_bytes, without changing any word/character in the file — only where the
     newlines fall.
 
     This exists in addition to transcribe_with_local_whisper() pre-splitting
-    transcript-raw.txt, because that only guarantees the *first* file pi reads is safe.
-    Every later stage's output is written by pi itself (following prompt instructions
-    like "keep line breaks as in the original"), and a model — especially a small local
-    one — isn't guaranteed to honor that. If e.g. pass 0's cleanup model flattens
-    transcript.txt back into one long paragraph while "cleaning" it, pass 1 would
-    silently see only a truncated prefix of the talk, with no error raised anywhere.
-    Called on every stage's output right after _require() confirms it exists.
+    transcript-raw.txt, because that only guarantees the *first* file opencode reads is
+    safe. Every later stage's output is written by opencode itself (following prompt
+    instructions like "keep line breaks as in the original"), and a model — especially a
+    small local one — isn't guaranteed to honor that. If e.g. pass 0's cleanup model
+    flattens transcript.txt back into one long paragraph while "cleaning" it, pass 1
+    would silently see only a truncated prefix of the talk, with no error raised
+    anywhere. Called on every stage's output right after _require() confirms it exists.
     """
     text = path.read_text()
     lines = text.split("\n")
@@ -267,58 +305,66 @@ def ensure_no_long_lines(path: Path, max_bytes: int = PI_READ_LINE_LIMIT_BYTES) 
             out_lines.append(current)
 
     path.write_text("\n".join(out_lines))
-    logger.debug("  rewrapped long line(s) in %s to stay under pi's ~%dKB read limit", path.name, max_bytes // 1000)
+    logger.debug("  rewrapped long line(s) in %s to stay under the ~%dKB read-line safety margin", path.name, max_bytes // 1000)
 
 
-def run_pi(
-    *, attachments: list[Path], prompt_file: Path, tools: str | None, model: str | None,
+def run_opencode(
+    *, attachments: list[Path], prompt_file: Path, model: str | None,
     logfile: Path, cwd: Path, substitutions: dict[str, str] | None = None,
 ) -> None:
-    """Invoke pi non-interactively: pi -p @file1 @file2 "<prompt>" --tools ...
+    """Invoke opencode non-interactively:
+    opencode run --file f1 --file f2 --model <provider/model> --auto "<prompt>"
 
-    pi resolves relative file operations (e.g. "write to extract.md") against its own
-    process cwd, not against the @attachments' paths — there's no --cwd flag (see
-    earendil-works/pi#4745) — so we set the subprocess cwd explicitly to `workdir`.
-    Without this, pi writes/reads relative filenames wherever this script happened to be
-    launched from, and the pipeline silently looks for output in the wrong place.
+    No custom agent is selected: every call uses opencode's normal/default agent.
+
+    We set the subprocess cwd explicitly to `workdir` (opencode resolves relative file
+    operations like "write to extract.md" against its own process cwd), and pass --auto
+    so a headless run never blocks waiting for an interactive permission prompt.
     """
     prompt_text = prompt_file.read_text()
     # Fill in values the script already knows (e.g. the talk's date, derived from the
-    # filename) instead of leaving pi to infer them from the transcript, which is
+    # filename) instead of leaving opencode to infer them from the transcript, which is
     # unreliable for things speakers rarely state out loud.
     for key, value in (substitutions or {}).items():
         prompt_text = prompt_text.replace(key, value)
 
-    cmd = ["pi", "-p"] + [f"@{p}" for p in attachments] + [prompt_text, " "] #--no-notify "]
-    if tools:
-        cmd += ["--tools", tools]
+    # OpenCode run does not support a --dir flag in the installed CLI version.
+    # Run the process with cwd=WORK_DIR and align PWD so OpenCode resolves its
+    # project root and all relative paths from the intended working directory.
+    cmd = ["opencode", "run"]
+    for p in attachments:
+        cmd += ["--file", str(p)]
     if model:
         cmd += ["--model", model]
-    if model in (GEMINI_MODEL_2, LOCAL_MODEL_2):
-        cmd += ["--thinking", "minimal"]
-    # Extra flags for pi itself (e.g. a debug flag printing which provider/model in
-    # provider-fallback.json actually served each request). Varies by pi version/config,
-    # so it's an opt-in env var: export PI_EXTRA_ARGS="--log-level debug"
-    cmd += os.environ.get("PI_EXTRA_ARGS", "").split()
+    cmd += ["--auto", prompt_text]
+    # Extra flags for opencode itself (e.g. --log-level debug). Varies by opencode
+    # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level debug"
+    cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
+
+    env = os.environ.copy()
+    # Enable opencode's web search integration for the enrichment pass.
+    env.setdefault("OPENCODE_ENABLE_EXA", "1")
+    # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both
+    # aligned so all relative writes land in the requested WORK_DIR/run directory.
+    env["PWD"] = str(cwd.resolve())
 
     logger.info(
-        "Running pi (cwd=%s): pi -p %s ... --tools %s%s",
-        cwd, " ".join(f"@{p.name}" for p in attachments), tools, f" --model {model}" if model else "",
+        "Running opencode (cwd=%s): opencode run %s ...%s",
+        cwd, " ".join(f"--file {p.name}" for p in attachments), f" --model {model}" if model else "",
     )
 
     # Stream instead of subprocess.run(): piping stdout straight into logfile with a raw
-    # open() bypasses the logging module (no timestamps), and pi's real-time activity
-    # (tool calls, retries, which provider actually answered) stays invisible until the
-    # whole call finishes. Streaming line-by-line lets us timestamp every row and mirror
-    # it into the main run log so it's visible live with -v.
+    # open() bypasses the logging module (no timestamps), and opencode's real-time
+    # activity (tool calls, retries, which provider actually answered) stays invisible
+    # until the whole call finishes. Streaming line-by-line lets us timestamp every row
+    # and mirror it into the main run log so it's visible live with -v.
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, text=False, bufsize=0,
-        # NOTE: stdin=subprocess.PIPE (closed immediately below) is NOT equivalent to
-        # stdin=subprocess.DEVNULL — that was the actual bug. pi has a confirmed,
-        # still-open issue (earendil-works/pi#4303): in -p/print mode, if stdin is
-        # /dev/null it emits its full response and then never exits (sits in
-        # epoll_wait forever); but if stdin is a *pipe* that's closed immediately
-        # (even having received zero bytes), it exits normally right after finishing.
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env, text=False, bufsize=0,
+        # Close stdin immediately rather than passing DEVNULL: several non-interactive
+        # CLI agents (pi's -p mode being the original case that prompted this) sit in
+        # epoll_wait forever if stdin is /dev/null but exit cleanly once stdin is a pipe
+        # that's been closed. Cheap and harmless to keep for opencode too; drop it if you
+        # confirm opencode's `run` doesn't need it.
         stdin=subprocess.PIPE,
         start_new_session=True,  # own process group, so we can clean up stragglers below
     )
@@ -326,11 +372,11 @@ def run_pi(
 
     # Read with a poll/timeout loop instead of `for line in proc.stdout`, which blocks
     # until EOF — requiring every process holding the write end open to close it, not
-    # just pi. pi's tools (e.g. aio-websearch, which looks like it shells out to
-    # fetch/render pages) can spawn a subprocess that inherits this pipe's fd and never
-    # closes it, so pi finishes and exits cleanly but the pipe never sees EOF because a
-    # grandchild still holds it open. Polling treats "pi's own process has exited" as
-    # the real completion signal, independent of anything else holding the pipe.
+    # just opencode. A tool opencode invokes (e.g. webfetch rendering a page) could in
+    # principle spawn a subprocess that inherits this pipe's fd and never closes it, so
+    # opencode finishes and exits cleanly but the pipe never sees EOF because a
+    # grandchild still holds it open. Polling treats "opencode's own process has exited"
+    # as the real completion signal, independent of anything else holding the pipe.
     buf = b""
     with open(logfile, "w") as lf:
         started = time.monotonic()
@@ -346,16 +392,16 @@ def run_pi(
                         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         lf.write(f"{ts} {line}\n")
                         lf.flush()
-                        logger.debug("[pi] %s", line)
+                        logger.debug("[opencode] %s", line)
                     continue  # more may be buffered; keep draining first
-            # No data ready. If pi's own process already exited, we're done — anything
-            # still holding the pipe open is a leftover grandchild, not pi.
+            # No data ready. If opencode's own process already exited, we're done —
+            # anything still holding the pipe open is a leftover grandchild, not opencode.
             if proc.poll() is not None:
                 break
 
             elapsed = time.monotonic() - started
-            if elapsed >= PI_TIMEOUT_SECONDS:
-                logger.error("pi timed out after %.0f seconds; aborting pipeline", elapsed)
+            if elapsed >= OPENCODE_TIMEOUT_SECONDS:
+                logger.error("opencode timed out after %.0f seconds; aborting pipeline", elapsed)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
@@ -367,24 +413,24 @@ def run_pi(
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
-                raise TimeoutError(f"pi exceeded the hard timeout of {PI_TIMEOUT_SECONDS}s")
+                raise TimeoutError(f"opencode exceeded the hard timeout of {OPENCODE_TIMEOUT_SECONDS}s")
         if buf:
             line = buf.decode("utf-8", errors="replace")
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             lf.write(f"{ts} {line}\n")
-            logger.debug("[pi] %s", line)
+            logger.debug("[opencode] %s", line)
 
     returncode = proc.returncode
 
-    # Best-effort cleanup of leftover descendants (e.g. a headless browser/fetcher
-    # aio-websearch spawned) so they don't pile up over many batches.
+    # Best-effort cleanup of leftover descendants (e.g. a headless fetch opencode's
+    # webfetch tool spawned) so they don't pile up over many batches.
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         pass
 
     if returncode != 0:
-        raise RuntimeError(f"pi call failed (exit {returncode}). See {logfile} for details.")
+        raise RuntimeError(f"opencode call failed (exit {returncode}). See {logfile} for details.")
 
 
 def _whisper_model_is_cached(whisper_model: str) -> bool:
@@ -411,7 +457,7 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
 
     # Join whisper's own per-phrase segments with newlines instead of using
     # result["text"] (one giant single-line string for the whole recording): a ~1-hour
-    # talk produces a ~50-60KB single line, blowing past pi's per-line read limit
+    # talk produces a ~50-60KB single line, blowing past the per-line read-limit safety margin
     # (50KB) and silently truncating whatever pass reads this file first (pass 0
     # cleanup) to just the opening minutes, with no error. Segment boundaries are
     # whisper's own phrase breaks, not a rewording, so this changes nothing about the
@@ -434,30 +480,29 @@ def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
 
 
 def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
-    """Light pi pass over the raw whisper output: drop duplicated/hallucinated lines and
-    repeated filler ("grazie grazie", "buongiorno buongiorno", ...), fix obvious
-    mis-transcription typos — nothing summarized, nothing reworded, no content removed.
-    Writes transcript.txt, which every later stage (extract, and the final transcript
-    PDF) actually consumes.
+    """Light opencode pass over the raw whisper output: drop duplicated/hallucinated
+    lines and repeated filler ("grazie grazie", "buongiorno buongiorno", ...), fix
+    obvious mis-transcription typos — nothing summarized, nothing reworded, no content
+    removed. Writes transcript.txt, which every later stage (extract, and the final
+    transcript PDF) actually consumes.
 
     model_fast is accepted (and used by every other stage) but deliberately ignored
     here: cleanup is forced onto GEMINI_MODEL_2 since this pass is mechanical enough not
     to need a cloud model and runs fully offline via ollama.
 
-    tools is "write" only, NOT "read,write": @attachment already embeds
-    transcript-raw.txt's full content inline in the prompt pi sends the model (confirmed
-    via pi's own session log — the whole file shows up as a <file> block in the first
-    user message, no size cap), so the model never needs to fetch it again. Offering
-    `read` anyway invites a small local model to redundantly re-read a file it already
-    has in full — and pi's `read` tool caps total output at ~50KB per call regardless of
-    line length, so on a ~55KB transcript that self-read comes back silently truncated
-    (~93% of the file) and the model "cleans" only what it got. Removing `read` closes
-    that path outright.
+    Uses opencode's default agent (edit only, no read/bash/web): --file already embeds
+    transcript-raw.txt's full content inline in the message opencode sends the model, so
+    the model never needs to fetch it again. Granting `read` anyway invites a small
+    local model to redundantly re-read a file it already has in full — and per
+    OPENCODE_READ_LINE_LIMIT_BYTES's comment, opencode's own `read` tool may have a
+    similar per-line cap to pi's ~50KB one, so on a long transcript that self-read could
+    come back truncated and the model "cleans" only what it got. Denying `read` in the
+    agent closes that path outright.
     """
-    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_MODEL_1)
-    run_pi(
+    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST)
+    run_opencode(
         attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        tools="write", model=GEMINI_MODEL_1, logfile=workdir / "pass0.log", cwd=workdir,
+        model=GEMINI_LATEST, logfile=workdir / "pass0.log", cwd=workdir,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
@@ -465,12 +510,12 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
 
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
     logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
-    # tools="write" only, same reasoning as stage_cleanup: transcript.txt is already
-    # fully inlined via @attachment, and this stage never opens any other file, so
-    # `read` would only ever be a redundant, truncation-prone re-fetch.
-    run_pi(
+    # opencode's default agent, same reasoning as stage_cleanup: transcript.txt is already
+    # fully inlined via --file, and this stage never opens any other file, so `read`
+    # would only ever be a redundant, possibly-truncated re-fetch.
+    run_opencode(
         attachments=[workdir / "transcript.txt"], prompt_file=PROMPTS_DIR / "pass1-extract.md",
-        tools="write", model=GEMINI_MODEL_1, logfile=workdir / "pass1.log", cwd=workdir,
+        model=GEMINI_LATEST, logfile=workdir / "pass1.log", cwd=workdir,
     )
     _require(workdir / "extract.md", "Pass 1")
     logger.info("  wrote %s", workdir / "extract.md")
@@ -479,8 +524,8 @@ def stage_extract(workdir: Path, model_fast: str | None) -> None:
 def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     """Pass 2: look up each extracted topic/entity and write a short background note
     for it. Batch size adapts to ENRICH_MODEL (see its comment above): a cloud model
-    gets BATCH_SIZE items per pi call, a local model gets ENRICH_BATCH_SIZE_LOCAL (1),
-    each call's own web-search results otherwise blow past a local context window.
+    gets BATCH_SIZE items per opencode call, a local model gets ENRICH_BATCH_SIZE_LOCAL
+    (1), each call's own web-search results otherwise blow past a local context window.
 
     Per-call outputs (one .md per batch, or per item when local) live in their own
     workdir/enrich/ subfolder so a many-batches local run doesn't clutter workdir with
@@ -518,14 +563,16 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
         label = batch[0] if batch_size == 1 else f"{len(batch)} items"
         logger.info("  batch %d/%d: %s -> %s", idx + 1, len(batches), label, batch_file.name)
 
-        # cwd=enrich_dir (not workdir) so pi's relative "write to {{OUTPUT_FILE}}"
+        # cwd=enrich_dir (not workdir) so opencode's relative "write to {{OUTPUT_FILE}}"
         # lands batch_file.name inside enrich/, matching where batch_file actually is.
-        run_pi(
-            attachments=[], prompt_file=prompt_file, tools=None, model=ENRICH_MODEL,
-            logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir, 
+        # opencode's default agent grants webfetch/websearch (needs the real web lookups)
+        # plus edit, unlike the write-only agents used elsewhere in this pipeline.
+        run_opencode(
+            attachments=[], prompt_file=prompt_file, model=ENRICH_MODEL,
+            logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir,
         )
 
-        if not is_local:  # local pi calls don't hit a cloud TPM limit, so no need to wait
+        if not is_local:  # local opencode calls don't hit a cloud TPM limit, so no need to wait
             logger.info(" Sleeping 1 min... TPM limit ")
             time.sleep(60)
 
@@ -551,16 +598,16 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
 def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
     logger.info("[5/7] Pass 3: synthesis into full academic notes (no info dropped)")
-    logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of pi)", date_str)
+    logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of opencode)", date_str)
     # Deliberately NOT attaching transcript.txt: extract.md's "Speaker's claims &
     # arguments" section is already a compressed-but-complete, sentence-by-sentence
     # record of the talk (see pass1-extract.md's no-ellipsis rule), so re-sending the
-    # full transcript on top would just burn tokens for content pi already has.
-    # tools="write" only — both attachments are already fully inlined, and this stage
+    # full transcript on top would just burn tokens for content opencode already has.
+    # opencode's default agent — both attachments are already fully inlined, and this stage
     # never needs to open any other file.
-    run_pi(
+    run_opencode(
         attachments=[workdir / "extract.md", workdir / "background.md"],
-        prompt_file=PROMPTS_DIR / "pass3-synthesize.md", tools="write", model=GEMINI_MODEL_1,
+        prompt_file=PROMPTS_DIR / "pass3-synthesize.md", model=GEMINI_LATEST,
         logfile=workdir / "pass3.log", cwd=workdir, substitutions={"{{DATA}}": date_str},
     )
     _require(workdir / "notes.md", "Pass 3")
@@ -571,13 +618,14 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
     logger.info("[6/7] Pass 4: verification (flags unsupported claims, deletes nothing)")
     # extract.md (not transcript.txt) is the ground truth pass4-verify.md checks the
     # speaker's-view sentences against, so it's attached here instead of the full
-    # transcript. `read` is kept here (unlike cleanup/extract/synthesize above): this
-    # pass uses `edit` to annotate notes.md in place, which needs to read current file
-    # state to locate exact text to replace — not the same safe no-op that removing
-    # `read` is for a pass that only ever writes fresh output from inlined attachments.
-    run_pi(
+    # transcript. The opencode's default agent grants `read` here (unlike the write-only
+    # agents above): this pass uses `edit` to annotate notes.md in place, which needs to
+    # read current file state to locate exact text to replace — not the same safe no-op
+    # that denying `read` is for a pass that only ever writes fresh output from inlined
+    # attachments.
+    run_opencode(
         attachments=[workdir / "notes.md", workdir / "extract.md", workdir / "background.md"],
-        prompt_file=PROMPTS_DIR / "pass4-verify.md", tools="read,write,edit", model=GEMINI_MODEL_1,
+        prompt_file=PROMPTS_DIR / "pass4-verify.md", model=GEMINI_LATEST_LOW,
         logfile=workdir / "pass4.log", cwd=workdir,
     )
     _require(workdir / "notes.md", "Pass 4")
@@ -798,16 +846,17 @@ def stage_pdf(workdir: Path, run_name: str) -> None:
 def _require(path: Path, stage_name: str) -> None:
     if not path.exists() or not path.read_text().strip():
         raise RuntimeError(f"{stage_name} did not produce {path.name} — check the matching pass log in {path.parent} before continuing.")
-    # Belt-and-suspenders: whatever pi/the model wrote, make sure it doesn't contain a
-    # line pi itself can't fully read back in a later stage (see ensure_no_long_lines()
-    # for why this can't be guaranteed by prompt instructions alone).
+    # Belt-and-suspenders: whatever opencode/the model wrote, make sure it doesn't
+    # contain a line opencode itself can't fully read back in a later stage (see
+    # ensure_no_long_lines() for why this can't be guaranteed by prompt instructions
+    # alone).
     ensure_no_long_lines(path)
 
 
 def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
     """When resuming with --from-stage, fail fast with a clear message if the files that
-    stage depends on aren't already in workdir, instead of letting pi run against a
-    missing @attachment."""
+    stage depends on aren't already in workdir, instead of letting opencode run against
+    a missing --file attachment."""
     missing = [f for f in STAGE_REQUIRES.get(from_stage, []) if not (workdir / f).exists()]
     if missing:
         raise RuntimeError(f"--from-stage {from_stage} requires {', '.join(missing)} to already exist in {workdir}, but they don't. Run from an earlier stage first.")
@@ -875,8 +924,8 @@ def check_environment() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     problems = []
-    if shutil.which("pi") is None:
-        problems.append("`pi` not found on PATH — required for extract/enrich/synthesize/verify")
+    if shutil.which("opencode") is None:
+        problems.append("`opencode` not found on PATH — required for cleanup/extract/enrich/synthesize/verify. Install it, then run `opencode auth login` for your provider(s).")
 
     if weasyprint is None:
         problems.append(
@@ -906,11 +955,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", type=Path, default=None, help="Process a single audio file instead of scanning INPUT_DIR")
     parser.add_argument(
-        "--model-fast", default=os.environ.get("PI_MODEL_FAST"),
-        help=f"Model for extract/enrich passes (env: PI_MODEL_FAST). Does NOT affect cleanup (pass 0), "
-             f"which is always forced to the local CLEANUP_MODEL ({GEMINI_MODEL_1}) regardless of this flag.",
+        "--model-fast", default=os.environ.get("OPENCODE_MODEL_FAST"),
+        help=f"Model for extract/enrich passes (env: OPENCODE_MODEL_FAST), as provider/model. Does NOT affect "
+             f"cleanup (pass 0), which is always forced to the local CLEANUP_MODEL ({GEMINI_LATEST}) regardless of this flag.",
     )
-    parser.add_argument("--model-strong", default=os.environ.get("PI_MODEL_STRONG"), help="Model for synthesize/verify passes (env: PI_MODEL_STRONG)")
+    parser.add_argument("--model-strong", default=os.environ.get("OPENCODE_MODEL_STRONG"), help="Model for synthesize/verify passes, as provider/model (env: OPENCODE_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT, help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
     parser.add_argument("--from-stage", choices=STAGES, default="transcribe", help="Resume from this stage (requires --file; reuses existing intermediate files)")
     parser.add_argument("--keep-input", action="store_true", help="Don't move processed files into INPUT_DIR/processed/")
