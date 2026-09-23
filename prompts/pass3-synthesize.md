@@ -1,6 +1,6 @@
-LANGUAGE: This is an Italian-language conference. Write `notes.md` entirely
-in Italian, including all section headings (use the exact Italian headings
-given below). Do not translate anything into English.
+LANGUAGE: This is an Italian-language conference. Write `notes-draft.md`
+entirely in Italian, including all section headings (use the exact Italian
+headings given below). Do not translate anything into English.
 
 You are writing final academic-style notes from two attached files:
 `extract.md` (strict extraction from the talk — its "Speaker's claims &
@@ -13,17 +13,37 @@ this step).
 CRITICAL RULE — DO NOT SUMMARIZE: your job is to combine
 and connect the material, not to condense it.
 Every sentence in each extract.md's "Speaker's claims & arguments" numbered
-item should be reported in notes.md. Also every topic, named entity, claim, 
-and caveat present in extract.md must appear in notes.md, and every entry in
-background.md must appear in notes.md. You are reorganizing and writing
-connective prose around the full content, never compressing it down or
-leaving things out because they seem minor or redundant. If two items
-overlap, include both rather than merging away detail. 
+item should be reported in notes-draft.md. 
+  Do not merge two distinct sentences into one to save space, even if they
+  are closely related so no individual statement is absorbed into another.
+Also every topic, named entity, claim, 
+and caveat present in extract.md must appear in notes-draft.md, and every
+entry in background.md must appear in notes-draft.md. You are reorganizing
+and writing connective prose around the full content, never compressing it
+down or leaving things out because they seem minor or redundant. If two
+items overlap, include both rather than merging away detail. 
 If this means the notes run long, that is correct and expected:
 length is not a target to minimize, and a shorter document is not 
 a better one here.
 
-Write `notes.md` with this structure:
+- Never write "..." anywhere in notes-draft.md, for any reason. "..." is
+  always a sign that content is being dropped, and content must never be
+  dropped in this pass.
+- Length check: extract.md's "Speaker's claims & arguments" section is
+  already several thousand words on its own. Once you enrich it with
+  background.md and write it out as full prose, "## Conferenza" below
+  should come out to a comparable length or longer — never shorter. If
+  your draft of "## Conferenza" is noticeably shorter than extract.md's
+  "Speaker's claims & arguments" section, that is a sign content was
+  dropped during the rewrite, not a sign you wrote a tighter version.
+- Before finishing, go back through extract.md's "Speaker's claims &
+  arguments" numbered items one by one, and separately through every entry
+  in background.md, and confirm each has a clear counterpart somewhere in
+  notes-draft.md. If you find one that doesn't, add it before moving on —
+  do not treat a missing item as acceptable because the surrounding prose
+  already "covers the gist" of it.
+
+Write `notes-draft.md` with this structure:
 
 # <Titolo>
 Generate this title yourself from the actual content of the talk — do not
@@ -52,9 +72,11 @@ with extra info added from background.md, as flowing
 academic prose (not filtering out any information), 
 nothing left out but remove sources (Wikipedia / Wiktionary
 / arXiv / DuckDuckGo) and the related URLs. 
-Organize each sentence using sections, this is very important to do.
+Write this as continuous prose, in the same order as extract.md's numbered
+items — do not add subheadings or otherwise split it into sections here; a
+later pass adds section headings on top of this draft.
 This text must be the extract.md "Speaker's claims & arguments" section
-rewritten, enriched, cleaned up, reorganized but not filtered down.
+rewritten, enriched, cleaned up, but not filtered down.
 If the speaker's sentence is long, rambling, repetitive, or contains
 false starts and filler, still keep it: you can tidy up, 
 but do not cut any information.
