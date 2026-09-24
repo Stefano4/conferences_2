@@ -636,9 +636,12 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
 
 # --- PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required) ---------
 PDF_MARGIN = "2cm"
-PDF_FONT_SIZE = "12pt"
+PDF_FONT_SIZE = "12pt"             # notes.pdf
+TRANSCRIPT_PDF_FONT_SIZE = "10pt"  # transcript.pdf — smaller since it's raw reference text, not the primary read
 PDF_FONT_FAMILY = "Georgia, 'Times New Roman', serif"
 
+# Spacing tightened for density (smaller line-height and margins throughout) so notes.pdf
+# fits more per page instead of reading like a print-book layout.
 PDF_CSS = """\
 @page {{
     size: A4;
@@ -663,61 +666,61 @@ PDF_CSS = """\
 body {{
     font-family: {font_family};
     font-size: {font_size};
-    line-height: 1.75;
+    line-height: 1.4;
     color: #1a1a1a;
 }}
 
 h1 {{
     string-set: doc-title content();
-    font-size: 22pt;
+    font-size: 20pt;
     font-weight: 700;
     color: #0f1f44;
     border-bottom: 3px solid #0f1f44;
-    padding-bottom: 8px;
-    margin: 0 0 24px 0;
+    padding-bottom: 6px;
+    margin: 0 0 14px 0;
     page-break-after: avoid;
 }}
 
 h2 {{
-    font-size: 14pt;
+    font-size: 13pt;
     font-weight: 700;
     color: #0f1f44;
     border-left: 4px solid #3762cc;
-    padding-left: 10px;
-    margin: 30px 0 10px 0;
+    padding-left: 9px;
+    margin: 16px 0 6px 0;
     page-break-after: avoid;
 }}
 
 h3 {{
-    font-size: 12pt;
+    font-size: 11.5pt;
     font-weight: 700;
     color: #1e3468;
-    margin: 18px 0 8px 0;
+    margin: 10px 0 4px 0;
     page-break-after: avoid;
 }}
 
 p {{
-    margin: 0 0 10px 0;
+    margin: 0 0 6px 0;
     text-align: justify;
     orphans: 3;
     widows: 3;
 }}
 
 ul, ol {{
-    margin: 6px 0 12px 0;
-    padding-left: 22px;
+    margin: 3px 0 8px 0;
+    padding-left: 20px;
 }}
 
 li {{
-    margin-bottom: 5px;
-    line-height: 1.65;
+    margin-bottom: 2px;
+    line-height: 1.35;
 }}
 
 blockquote {{
     border-left: 4px solid #3762cc;
     background: #f0f4ff;
-    padding: 10px 16px;
-    margin: 14px 0;
+    padding: 6px 12px;
+    margin: 8px 0;
     color: #1e3468;
     font-style: italic;
     border-radius: 0 4px 4px 0;
@@ -745,22 +748,22 @@ a {{
 table {{
     width: 100%;
     border-collapse: collapse;
-    margin: 14px 0;
-    font-size: 10pt;
+    margin: 8px 0;
+    font-size: 9.5pt;
     page-break-inside: avoid;
 }}
 
 th {{
     background: #0f1f44;
     color: white;
-    padding: 8px 12px;
+    padding: 5px 10px;
     text-align: left;
     font-weight: 600;
 }}
 
 td {{
     border: 1px solid #ccd;
-    padding: 7px 12px;
+    padding: 4px 10px;
     vertical-align: top;
 }}
 
@@ -769,7 +772,7 @@ tr:nth-child(even) td {{ background: #f7f8fc; }}
 hr {{
     border: none;
     border-top: 1px solid #dde;
-    margin: 24px 0;
+    margin: 14px 0;
 }}
 """
 
@@ -944,22 +947,28 @@ def _markdown_to_html(md_text: str) -> str:
 
 def _text_to_html(text: str, title: str) -> str:
     """Render plain transcript text as simple justified paragraphs, with a title heading
-    so the PDF header (string-set on h1) picks it up."""
+    so the PDF header (string-set on h1) picks it up.
+
+    Raw transcript text is often one sentence per line with no blank line between them
+    (that's just how whisper/opencode wrote it out) — those are NOT paragraph breaks, so
+    a single \\n inside a paragraph is collapsed to a space and left to wrap normally.
+    Only a blank line (\\n\\s*\\n) starts a new <p>."""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
     body = [f"<h1>{html.escape(title)}</h1>"]
     for para in paragraphs:
-        body.append(f"<p>{html.escape(para).replace(chr(10), '<br>')}</p>")
+        flat = re.sub(r"\s*\n\s*", " ", para).strip()
+        body.append(f"<p>{html.escape(flat)}</p>")
     return "\n".join(body)
 
 
-def _render_pdf(html_body: str, dest: Path) -> None:
+def _render_pdf(html_body: str, dest: Path, font_size: str = PDF_FONT_SIZE) -> None:
     if weasyprint is None:
         raise RuntimeError(
             f"weasyprint could not be imported ({WEASYPRINT_IMPORT_ERROR}). This is almost always a "
             f"native-library path issue, not a missing pip install — see check_environment()'s message "
             f"at startup for the fix."
         )
-    css = PDF_CSS.format(margin=PDF_MARGIN, font_size=PDF_FONT_SIZE, font_family=PDF_FONT_FAMILY)
+    css = PDF_CSS.format(margin=PDF_MARGIN, font_size=font_size, font_family=PDF_FONT_FAMILY)
     weasyprint.HTML(string=HTML_TEMPLATE.format(css=css, body=html_body)).write_pdf(str(dest))
     logger.info("  wrote %s", dest)
 
@@ -983,7 +992,7 @@ def stage_pdf(workdir: Path, run_name: str) -> None:
     _render_html(notes_html_body, workdir / "notes.html")
 
     transcript_text = (workdir / "transcript.txt").read_text()
-    _render_pdf(_text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf")
+    _render_pdf(_text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf", font_size=TRANSCRIPT_PDF_FONT_SIZE)
 
     dests = {
         "notes.md": OUTPUT_DIR / f"{run_name}-notes.md",
