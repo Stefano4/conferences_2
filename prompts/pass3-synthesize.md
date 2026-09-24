@@ -88,8 +88,6 @@ after it has clearly eneded, you can drop that sentence.
 to make the notes more readable
 - Do not leave out any of the extract.md's "Speaker's claims & arguments" facts, information or anecdotes.
 
-## Riferimenti
-Numbered list of every source URL used in background.md.
 
 Hard rule:
 - Do not drop, merge-away, or silently shorten any item from extract.md or
