@@ -773,10 +773,160 @@ hr {{
 }}
 """
 
+# --- HTML styling (screen/mobile: separate from PDF_CSS, which is tuned for a printed
+# A4 page — @page margins, pt sizes and justified text all work against you on a phone) --
+HTML_CSS = """\
+:root {
+    color-scheme: light dark;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1rem;
+    line-height: 1.7;
+    color: #1a1a1a;
+    background: #ffffff;
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 1.5rem 1.25rem 3rem;
+}
+
+h1 {
+    font-size: clamp(1.4rem, 5vw, 1.8rem);
+    font-weight: 700;
+    color: #0f1f44;
+    border-bottom: 3px solid #0f1f44;
+    padding-bottom: 0.5rem;
+    margin: 0 0 1.5rem 0;
+    line-height: 1.3;
+}
+
+h2 {
+    font-size: clamp(1.1rem, 4vw, 1.25rem);
+    font-weight: 700;
+    color: #0f1f44;
+    border-left: 4px solid #3762cc;
+    padding-left: 0.6rem;
+    margin: 2rem 0 0.6rem 0;
+    line-height: 1.3;
+}
+
+h3 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #1e3468;
+    margin: 1.2rem 0 0.5rem 0;
+}
+
+p {
+    margin: 0 0 0.75rem 0;
+    text-align: left; /* justify creates ragged word-spacing on narrow phone columns */
+}
+
+ul, ol {
+    margin: 0.4rem 0 0.9rem 0;
+    padding-left: 1.4rem;
+}
+
+li {
+    margin-bottom: 0.35rem;
+    line-height: 1.6;
+}
+
+blockquote {
+    border-left: 4px solid #3762cc;
+    background: #f0f4ff;
+    padding: 0.6rem 1rem;
+    margin: 1rem 0;
+    color: #1e3468;
+    font-style: italic;
+    border-radius: 0 4px 4px 0;
+}
+
+blockquote p { margin: 0; }
+
+code {
+    font-family: "Courier New", Courier, monospace;
+    font-size: 0.85em;
+    background: #f4f4f8;
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+    color: #c0392b;
+    word-break: break-word;
+}
+
+strong { font-weight: 700; }
+em { font-style: italic; color: #333; }
+
+a {
+    color: #3762cc;
+    text-decoration: none;
+}
+
+/* Tables can be wider than a phone screen; let them scroll horizontally within
+   themselves instead of overflowing (breaking) the whole page layout. */
+.table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 1rem 0;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+}
+
+th {
+    background: #0f1f44;
+    color: white;
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+td {
+    border: 1px solid #ccd;
+    padding: 0.45rem 0.75rem;
+    vertical-align: top;
+}
+
+tr:nth-child(even) td { background: #f7f8fc; }
+
+hr {
+    border: none;
+    border-top: 1px solid #dde;
+    margin: 1.5rem 0;
+}
+
+img { max-width: 100%; height: auto; }
+
+@media (prefers-color-scheme: dark) {
+    body { background: #14161c; color: #e8e8ea; }
+    h1, h2 { color: #a9c1ff; }
+    h1 { border-bottom-color: #a9c1ff; }
+    h2 { border-left-color: #7fa0ff; }
+    h3 { color: #cfd9ff; }
+    blockquote { background: #1d2233; color: #c9d3ff; border-left-color: #7fa0ff; }
+    code { background: #23262f; color: #ff8a75; }
+    th { background: #1d2848; }
+    td { border-color: #33384a; }
+    tr:nth-child(even) td { background: #1a1c24; }
+    a { color: #8fb0ff; }
+    hr { border-top-color: #33384a; }
+}
+"""
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="it">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>{css}</style>
 </head>
 <body>
@@ -815,10 +965,13 @@ def _render_pdf(html_body: str, dest: Path) -> None:
 
 
 def _render_html(html_body: str, dest: Path) -> None:
-    """Write a standalone, self-contained HTML file (same CSS/layout as the PDF, just
-    without WeasyPrint's page-specific @page rules mattering)."""
-    css = PDF_CSS.format(margin=PDF_MARGIN, font_size=PDF_FONT_SIZE, font_family=PDF_FONT_FAMILY)
-    dest.write_text(HTML_TEMPLATE.format(css=css, body=html_body), encoding="utf-8")
+    """Write a standalone, self-contained HTML file, styled for on-screen/mobile reading
+    (HTML_CSS) rather than reusing the print-tuned PDF_CSS: real padding instead of
+    @page margins (ignored by browsers), rem-based responsive type instead of fixed pt
+    sizes, left-aligned instead of justified text, a max-width for wide screens, a
+    prefers-color-scheme dark mode, and horizontally-scrollable tables."""
+    html_body = re.sub(r"(<table\b.*?</table>)", r'<div class="table-wrap">\1</div>', html_body, flags=re.DOTALL)
+    dest.write_text(HTML_TEMPLATE.format(css=HTML_CSS, body=html_body), encoding="utf-8")
     logger.info("  wrote %s", dest)
 
 
