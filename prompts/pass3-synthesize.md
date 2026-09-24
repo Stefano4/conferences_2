@@ -1,4 +1,4 @@
-LANGUAGE: This is an Italian-language conference. Write `notes-draft.md`
+LANGUAGE: This is an Italian-language conference. Write `notes.md`
 entirely in Italian, including all section headings (use the exact Italian
 headings given below). Do not translate anything into English.
 
@@ -10,15 +10,16 @@ your primary source for the speech content itself) and `background.md`
 (external context, already fetched — do not look anything up yourself in
 this step).
 
-CRITICAL RULE — DO NOT SUMMARIZE: your job is to combine
-and connect the material, not to condense it.
+CRITICAL RULE — DO NOT SUMMARIZE OR FILTER: your job is to combine
+and connect the material summing up information, not to condense it.
 Every sentence in each extract.md's "Speaker's claims & arguments" numbered
 item should be reported in notes-draft.md. 
-  Do not merge two distinct sentences into one to save space, even if they
-  are closely related so no individual statement is absorbed into another.
+
+Do not merge two distinct sentences into one to save space, even if they
+are closely related so no individual statement is absorbed into another.
 Also every topic, named entity, claim, 
 and caveat present in extract.md must appear in notes-draft.md, and every
-entry in background.md must appear in notes-draft.md. You are reorganizing
+entry in background.md should appear in notes-draft.md. You are reorganizing
 and writing connective prose around the full content, never compressing it
 down or leaving things out because they seem minor or redundant. If two
 items overlap, include both rather than merging away detail. 
@@ -43,7 +44,7 @@ a better one here.
   do not treat a missing item as acceptable because the surrounding prose
   already "covers the gist" of it.
 
-Write `notes-draft.md` with this structure:
+Write `notes.md` with this structure:
 
 # <Titolo>
 Generate this title yourself from the actual content of the talk — do not
@@ -73,10 +74,10 @@ academic prose (not filtering out any information),
 nothing left out but remove sources (Wikipedia / Wiktionary
 / arXiv / DuckDuckGo) and the related URLs. 
 Write this as continuous prose, in the same order as extract.md's numbered
-items — do not add subheadings or otherwise split it into sections here; a
-later pass adds section headings on top of this draft.
+items, add titled sections and subsections.
 This text must be the extract.md "Speaker's claims & arguments" section
 rewritten, enriched, cleaned up, but not filtered down.
+Use more or less the same amount of words and information as in the extract.md "Speaker's claims & arguments" section.
 If the speaker's sentence is long, rambling, repetitive, or contains
 false starts and filler, still keep it: you can tidy up, 
 but do not cut any information.
@@ -85,6 +86,7 @@ about something totally out of topic, before the real conference starts or
 after it has clearly eneded, you can drop that sentence.
 - Use Bold, italics, and underlining text as a skilled academic PhD student
 to make the notes more readable
+- Do not leave out any of the extract.md's "Speaker's claims & arguments" facts, information or anecdotes.
 
 ## Riferimenti
 Numbered list of every source URL used in background.md.

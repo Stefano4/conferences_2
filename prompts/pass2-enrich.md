@@ -7,9 +7,10 @@ Your ONLY job is to gather a definition and some information for the topics/enti
 You must NOT rely only on your own training knowledge for facts: every fact you
 write down must come from a response you actually fetched in this session.
 No API keys are available or needed — every source below is free/open.
+Do not think too much doing this task.
 
 For every successful lookup:
-- Paraphrase the finding in 2-4 sentences, in Italian,  —
+- Paraphrase the finding in 1 sentence, in Italian,  —
   do not copy source text verbatim.
 - Record which source it came from (Wikipedia / Wiktionary / arXiv /
   DuckDuckGo) and the URL.

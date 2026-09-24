@@ -7,17 +7,13 @@ PDF (4 files per recording).
 Transcription is done locally with mlx-whisper (no cloud calls, no API key needed). The
 raw transcript is first lightly cleaned up by opencode (forced onto a local model — see
 GEMINI_MODEL_2 — so this pass stays fully offline too), then that cleaned transcript
-feeds a 5-pass opencode pipeline:
+feeds a 4-pass opencode pipeline:
   0. cleanup     — de-dupe/de-hallucinate raw whisper output, drop filler repeats, fix
                    obvious typos. No content removed, nothing paraphrased.
   1. extract     — pull claims/topics/quotes from the cleaned transcript only.
   2. enrich      — look up each topic across free, no-key sources (opencode's hosted
                    websearch tool — see run_opencode()'s OPENCODE_ENABLE_EXA note).
-  3a. synthesize — expand + enrich into full academic notes as continuous prose,
-                   nothing dropped, no reorganizing (writes notes-draft.md).
-  3b. structure  — add section headings on top of the finished draft; reproduces
-                   everything else verbatim (writes notes.md). Split out from 3a on
-                   purpose — see stage_structure()'s docstring.
+  3. synthesize  — combine into full academic notes, nothing dropped.
   4. verify      — flag (never delete) anything not traceable to a source.
 
 Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — passes 2-4
@@ -98,7 +94,7 @@ INPUT_DIR = SCRIPT_DIR / "input"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 LOG_DIR = SCRIPT_DIR / "logs"
 
-STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "structure", "verify", "pdf"]
+STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", "pdf"]
 WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
 AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
 
@@ -142,7 +138,6 @@ STAGE_REQUIRES = {
     "extract": ["transcript.txt"],
     "enrich": ["extract.md"],
     "synthesize": ["extract.md", "background.md"],
-    "structure": ["notes-draft.md"],
     "verify": ["notes.md", "extract.md", "background.md"],
     "pdf": ["notes.md", "transcript.txt"],
 }
@@ -342,6 +337,8 @@ def run_opencode(
     if model:
         cmd += ["--model", model]
     cmd += ["--auto", prompt_text]
+    cmd += ["--thinking"]
+    cmd += [" --log - level DEBUG"]
     # Extra flags for opencode itself (e.g. --log-level debug). Varies by opencode
     # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level debug"
     cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
@@ -475,7 +472,7 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
 
 
 def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
-    logger.info("[1/8] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
+    logger.info("[1/7] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
     text = transcribe_with_local_whisper(audio, whisper_model)
 
     out = workdir / "transcript-raw.txt"
@@ -504,7 +501,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     come back truncated and the model "cleans" only what it got. Denying `read` in the
     agent closes that path outright.
     """
-    logger.info("[2/8] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST_LOW)
+    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST)
     run_opencode(
         attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
         model=GEMINI_LATEST, logfile=workdir / "pass0.log", cwd=workdir,
@@ -514,7 +511,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
-    logger.info("[3/8] Pass 1: extraction (transcript-only, no outside knowledge)")
+    logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
     # opencode's default agent, same reasoning as stage_cleanup: transcript.txt is already
     # fully inlined via --file, and this stage never opens any other file, so `read`
     # would only ever be a redundant, possibly-truncated re-fetch.
@@ -538,7 +535,7 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     """
     is_local = ENRICH_MODEL == LOCAL_MODEL
     batch_size = ENRICH_BATCH_SIZE_LOCAL if is_local else BATCH_SIZE
-    logger.info("[4/8] Pass 2: multi-source enrichment (batched, model=%s, batch_size=%d)", ENRICH_MODEL, batch_size)
+    logger.info("[4/7] Pass 2: multi-source enrichment (batched, model=%s, batch_size=%d)", ENRICH_MODEL, batch_size)
 
     extract_path = workdir / "extract.md"
     if not extract_path.exists():
@@ -602,50 +599,25 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
 
 def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
-    logger.info("[5/8] Pass 3a: synthesis into full academic notes, unstructured draft (no info dropped)")
+    logger.info("[5/7] Pass 3: synthesis into full academic notes (no info dropped)")
     logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of opencode)", date_str)
     # Deliberately NOT attaching transcript.txt: extract.md's "Speaker's claims &
     # arguments" section is already a compressed-but-complete, sentence-by-sentence
     # record of the talk (see pass1-extract.md's no-ellipsis rule), so re-sending the
     # full transcript on top would just burn tokens for content opencode already has.
-    # Opencode default agent — both attachments are already fully inlined, and this stage
-    # never needs to open any other file. Writes notes-draft.md, not notes.md: this pass
-    # only expands/enriches into continuous prose, no section headings — see
-    # stage_structure() for why that's a separate pass.
+    # opencode's default agent — both attachments are already fully inlined, and this stage
+    # never needs to open any other file.
     run_opencode(
         attachments=[workdir / "extract.md", workdir / "background.md"],
         prompt_file=PROMPTS_DIR / "pass3-synthesize.md", model=GEMINI_LATEST,
         logfile=workdir / "pass3.log", cwd=workdir, substitutions={"{{DATA}}": date_str},
     )
-    _require(workdir / "notes-draft.md", "Pass 3a")
-    logger.info("  wrote %s", workdir / "notes-draft.md")
-
-
-def stage_structure(workdir: Path, model_strong: str | None) -> None:
-    """Pass 3b: add section headings to notes-draft.md, producing notes.md.
-
-    Split out of stage_synthesize() on purpose: asking a small/fast model to enrich,
-    reorganize, destyle (strip citations/URLs), and prose-ify all in one pass was
-    causing it to quietly drop sentences — reorganizing by topic invites treating
-    similar-looking sentences as redundant and folding them together. This pass has
-    exactly one job (insert headings into an already-complete draft, reproduce
-    everything else verbatim) so there's no competing pressure to compress anything.
-
-    Uses the Opencode default agent, same as stage_synthesize: notes-draft.md is fully
-    inlined via --file, so no `read` is needed, and this pass only ever produces fresh
-    output (notes.md) rather than patching an existing one.
-    """
-    logger.info("[6/8] Pass 3b: adding section headings on top of the finished draft")
-    run_opencode(
-        attachments=[workdir / "notes-draft.md"], prompt_file=PROMPTS_DIR / "pass3b-structure.md",
-        model=GEMINI_LATEST, logfile=workdir / "pass3b.log", cwd=workdir,
-    )
-    _require(workdir / "notes.md", "Pass 3b")
+    _require(workdir / "notes.md", "Pass 3")
     logger.info("  wrote %s", workdir / "notes.md")
 
 
 def stage_verify(workdir: Path, model_strong: str | None) -> None:
-    logger.info("[7/8] Pass 4: verification (flags unsupported claims, deletes nothing)")
+    logger.info("[6/7] Pass 4: verification (flags unsupported claims, deletes nothing)")
     # extract.md (not transcript.txt) is the ground truth pass4-verify.md checks the
     # speaker's-view sentences against, so it's attached here instead of the full
     # transcript. The opencode's default agent grants `read` here (unlike the write-only
@@ -654,7 +626,7 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
     # that denying `read` is for a pass that only ever writes fresh output from inlined
     # attachments.
     run_opencode(
-        attachments=[workdir / "notes.md", workdir / "extract.md", workdir / "background.md"],
+        attachments=[workdir / "notes.md"],
         prompt_file=PROMPTS_DIR / "pass4-verify.md", model=GEMINI_LATEST_LOW,
         logfile=workdir / "pass4.log", cwd=workdir,
     )
@@ -664,7 +636,7 @@ def stage_verify(workdir: Path, model_strong: str | None) -> None:
 
 # --- PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required) ---------
 PDF_MARGIN = "2cm"
-PDF_FONT_SIZE = "10.5pt"
+PDF_FONT_SIZE = "12pt"
 PDF_FONT_FAMILY = "Georgia, 'Times New Roman', serif"
 
 PDF_CSS = """\
@@ -851,7 +823,7 @@ def _render_html(html_body: str, dest: Path) -> None:
 
 
 def stage_pdf(workdir: Path, run_name: str) -> None:
-    logger.info("[8/8] Rendering PDF/HTML outputs (WeasyPrint)")
+    logger.info("[7/7] Rendering PDF/HTML outputs (WeasyPrint)")
 
     notes_html_body = _markdown_to_html((workdir / "notes.md").read_text())
     _render_pdf(notes_html_body, workdir / "notes.pdf")
@@ -920,10 +892,6 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
         stage_enrich(workdir, args.model_fast)
     if start <= STAGES.index("synthesize"):
         stage_synthesize(workdir, args.model_strong, derive_date_from_filename(audio))
-        logger.info(" Sleeping 1 min... TPM limit ")
-        time.sleep(60)
-    if start <= STAGES.index("structure"):
-        stage_structure(workdir, args.model_strong)
         logger.info(" Sleeping 1 min... TPM limit ")
         time.sleep(60)
     if start <= STAGES.index("verify"):

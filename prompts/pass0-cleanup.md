@@ -34,14 +34,12 @@ Do exactly these three things, and nothing else:
 3. Correct obvious transcription typos.
    Fix clear, obvious errors that are plainly created by the transcription
    affecting grammar. Only fix something here if you
-   are confident it's a transcription error and that makes the sentence
-   grammatically incorrect.
+   are confident it's a transcription error.
    - Do NOT "correct" anything you are unsure about. Unknown or
      unfamiliar words, proper names, foreign terms, technical jargon,
      acronyms, or anything that could plausibly be a real word/name you
      simply don't recognize must be left exactly as transcribed — do not
      guess a "cleaner" spelling for it. Those get handled later.
-   - Just correct transcription error so clear that would affect grammar.
 
 Hard rules:
 - Do not summarize, paraphrase, compress, or reword anything beyond the
