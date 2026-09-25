@@ -138,7 +138,7 @@ STAGE_REQUIRES = {
     "extract": ["transcript.txt"],
     "enrich": ["extract.md"],
     "synthesize": ["extract.md", "background.md"],
-    "verify": ["notes.md", "extract.md", "background.md"],
+    "verify": ["notes.md"],
     "pdf": ["notes.md", "transcript.txt"],
 }
 
@@ -504,7 +504,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST)
     run_opencode(
         attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        model=GEMINI_LATEST, logfile=workdir / "pass0.log", cwd=workdir,
+        model=GEMINI_31_LOW, logfile=workdir / "pass0.log", cwd=workdir,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
@@ -1050,8 +1050,12 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
         time.sleep(60)
     if start <= STAGES.index("extract"):
         stage_extract(workdir, args.model_fast)
+        logger.info(" Sleeping 30 secs... TPM limit ")
+        time.sleep(30)
     if start <= STAGES.index("enrich"):
         stage_enrich(workdir, args.model_fast)
+        logger.info(" Sleeping 30 secs... TPM limit ")
+        time.sleep(30)
     if start <= STAGES.index("synthesize"):
         stage_synthesize(workdir, args.model_strong, derive_date_from_filename(audio))
         logger.info(" Sleeping 1 min... TPM limit ")

@@ -58,4 +58,5 @@ Hard rules:
   the speaker actually said, leave it in. Under-cleaning is fine;
   over-cleaning (removing real content) is not.
 
+Don't think too much, just do this job using few tokens.
 Write the cleaned result to `transcript.txt`, similar output number of words (besides hallucinated repetitions).

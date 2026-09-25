@@ -43,6 +43,7 @@ a better one here.
   notes-draft.md. If you find one that doesn't, add it before moving on —
   do not treat a missing item as acceptable because the surrounding prose
   already "covers the gist" of it.
+- Use Bold, italics, and underlining text as a skilled academic PhD student to make the notes more readable
 
 Write `notes.md` with this structure:
 
@@ -84,8 +85,7 @@ but do not cut any information.
 ONLY for the very first and last sentence, if the speaker is clearly talking
 about something totally out of topic, before the real conference starts or
 after it has clearly eneded, you can drop that sentence.
-- Use Bold, italics, and underlining text as a skilled academic PhD student
-to make the notes more readable
+- Use Bold, italics, and underlining text as a skilled academic PhD student to make the notes more readable
 - Do not leave out any of the extract.md's "Speaker's claims & arguments" facts, information or anecdotes.
 
 

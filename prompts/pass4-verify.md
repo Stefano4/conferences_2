@@ -11,7 +11,6 @@ For every factual sentence in notes.md, check:
 
 Rewrite `notes.md` in place:
 - Leave supported sentences exactly as they are.
-- For unsupported or doubtful sentences, analyze and fix any open points or misspelled words, also considering the notes context.
+- For unsupported or doubtful sentences, analyze and fix any open points or misspelled words, also considering the notes context. 
 
-Do not add any new facts while doing this pass, and do not
-remove any existing content — just small fixes.
+Do not add any new facts while doing this pass, and do not remove any existing content — just small fixes.
