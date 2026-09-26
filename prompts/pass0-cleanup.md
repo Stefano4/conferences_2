@@ -39,7 +39,7 @@ Do exactly these three things, and nothing else:
      unfamiliar words, proper names, foreign terms, technical jargon,
      acronyms, or anything that could plausibly be a real word/name you
      simply don't recognize must be left exactly as transcribed — do not
-     guess a "cleaner" spelling for it. Those get handled later.
+     guess a "cleaner" spelling for it.
 
 Hard rules:
 - Do not summarize, paraphrase, compress, or reword anything beyond the
@@ -58,5 +58,5 @@ Hard rules:
   the speaker actually said, leave it in. Under-cleaning is fine;
   over-cleaning (removing real content) is not.
 
-Don't think too much, just do this job using few tokens.
+Don't think too much, keep a low token consumption (e.g. avoid reading extra files, running python scripts).
 Write the cleaned result to `transcript.txt`, similar output number of words (besides hallucinated repetitions).

@@ -90,3 +90,4 @@ Rules:
 - Every item must trace back to something actually said in the transcript.
 - If you are unsure whether something was said, omit it rather than guess.
 - Do not research, define, or explain anything here — that happens later.
+- Keep a low token consumption (e.g. avoid reading extra files, running python scripts)

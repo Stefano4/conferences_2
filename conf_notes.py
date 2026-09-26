@@ -1017,6 +1017,37 @@ def _require(path: Path, stage_name: str) -> None:
     ensure_no_long_lines(path)
 
 
+STAGE_RETRY_ATTEMPTS = 3
+STAGE_RETRY_SLEEP_SECONDS = 60
+
+
+def _run_stage_with_retry(stage_name: str, func, *args, **kwargs):
+    """Run a stage function, retrying up to STAGE_RETRY_ATTEMPTS times with a
+    STAGE_RETRY_SLEEP_SECONDS pause between attempts if it raises.
+
+    Covers both kinds of stage failure this pipeline produces: RuntimeError (opencode
+    exited non-zero, or _require() found a stage "did not produce" its expected output
+    file) and TimeoutError (opencode exceeded OPENCODE_TIMEOUT_SECONDS). Re-raises the
+    last exception if every attempt fails, so process_file()'s own error handling
+    (logging + sys.exit / batch "failures" list) still runs exactly as before.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, STAGE_RETRY_ATTEMPTS + 1):
+        try:
+            return func(*args, **kwargs)
+        except (RuntimeError, TimeoutError) as e:
+            last_exc = e
+            if attempt < STAGE_RETRY_ATTEMPTS:
+                logger.warning(
+                    "  [%s] attempt %d/%d failed (%s) — sleeping %ds before retry",
+                    stage_name, attempt, STAGE_RETRY_ATTEMPTS, e, STAGE_RETRY_SLEEP_SECONDS,
+                )
+                time.sleep(STAGE_RETRY_SLEEP_SECONDS)
+            else:
+                logger.error("  [%s] failed after %d attempts", stage_name, STAGE_RETRY_ATTEMPTS)
+    raise last_exc
+
+
 def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
     """When resuming with --from-stage, fail fast with a clear message if the files that
     stage depends on aren't already in workdir, instead of letting opencode run against
@@ -1043,27 +1074,27 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
         _check_resume_prereqs(workdir, from_stage)
 
     if start <= STAGES.index("transcribe"):
-        stage_transcribe(audio, workdir, args.whisper_model)
+        _run_stage_with_retry("transcribe", stage_transcribe, audio, workdir, args.whisper_model)
     if start <= STAGES.index("cleanup"):
-        stage_cleanup(workdir, args.model_fast)
+        _run_stage_with_retry("cleanup", stage_cleanup, workdir, args.model_fast)
         logger.info(" Sleeping 1 min... TPM limit ")
         time.sleep(60)
     if start <= STAGES.index("extract"):
-        stage_extract(workdir, args.model_fast)
+        _run_stage_with_retry("extract", stage_extract, workdir, args.model_fast)
         logger.info(" Sleeping 30 secs... TPM limit ")
         time.sleep(30)
     if start <= STAGES.index("enrich"):
-        stage_enrich(workdir, args.model_fast)
+        _run_stage_with_retry("enrich", stage_enrich, workdir, args.model_fast)
         logger.info(" Sleeping 30 secs... TPM limit ")
         time.sleep(30)
     if start <= STAGES.index("synthesize"):
-        stage_synthesize(workdir, args.model_strong, derive_date_from_filename(audio))
+        _run_stage_with_retry("synthesize", stage_synthesize, workdir, args.model_strong, derive_date_from_filename(audio))
         logger.info(" Sleeping 1 min... TPM limit ")
         time.sleep(60)
     if start <= STAGES.index("verify"):
-        stage_verify(workdir, args.model_strong)
+        _run_stage_with_retry("verify", stage_verify, workdir, args.model_strong)
     if start <= STAGES.index("pdf"):
-        stage_pdf(workdir, run_name)
+        _run_stage_with_retry("pdf", stage_pdf, workdir, run_name)
 
     if not args.keep_input and from_stage == "transcribe":
         try:
