@@ -165,7 +165,15 @@ def _format_italian_date(y: int, m: int, d: int) -> str | None:
 
 def _parse_extract_items(extract_path: Path) -> list[str]:
     """Return every topic/entity listed under 'Topics & concepts mentioned' and
-    'Named entities' in extract.md."""
+    'Named entities' in extract.md.
+
+    The extract pass is itself an opencode call (often on a small/fast model), and
+    that model doesn't reliably follow the "- item" bullet format the prompt asks
+    for — it sometimes writes one bare item per line instead (no leading "- "/"* "/
+    "1. "). Treat any non-empty, non-heading line inside the section as an item
+    rather than requiring a bullet marker, so a items list that's really just
+    differently formatted isn't mistaken for an empty one.
+    """
     items, in_section = [], False
     for line in extract_path.read_text().splitlines():
         stripped = line.strip()
@@ -175,8 +183,13 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
         if in_section:
             if stripped.startswith("## "):
                 in_section = False
-            elif stripped.startswith("- "):
-                items.append(stripped[2:].strip())
+            elif stripped.startswith("#"):
+                continue  # some other heading level inside the section — skip, stay in_section
+            elif stripped:
+                # Strip a leading bullet/number marker if present, otherwise take the line as-is.
+                item = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)", "", stripped).strip()
+                if item:
+                    items.append(item)
     return items
 
 AGENT_PROFILES = {
@@ -448,7 +461,7 @@ def _whisper_model_is_cached(whisper_model: str) -> bool:
 
 def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
     if mlx_whisper is None:
-        raise RuntimeError("mlx-whisper not installed. Run: pip install mlx-whisper")
+        raise StagePermanentError("mlx-whisper not installed. Run: pip install mlx-whisper")
 
     if _whisper_model_is_cached(whisper_model):
         logger.debug("  Whisper model %s found in cache (%s) — no download needed", whisper_model, os.environ.get("HF_HOME"))
@@ -539,11 +552,14 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
     extract_path = workdir / "extract.md"
     if not extract_path.exists():
-        raise RuntimeError("extract.md not found — cannot run enrichment")
+        raise StagePermanentError("extract.md not found — cannot run enrichment")
 
     items = _parse_extract_items(extract_path)
     if not items:
-        raise RuntimeError("No topics/entities found in extract.md")
+        raise StagePermanentError(
+            "No topics/entities found in extract.md — check its 'Topics & concepts "
+            "mentioned' / 'Named entities' sections actually have content under them"
+        )
 
     batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
     logger.info("  splitting %d items into %d batches of up to %d", len(items), len(batches), batch_size)
@@ -1021,20 +1037,35 @@ STAGE_RETRY_ATTEMPTS = 3
 STAGE_RETRY_SLEEP_SECONDS = 60
 
 
+class StagePermanentError(RuntimeError):
+    """A stage failure that re-running the same stage against the same on-disk inputs
+    can never fix (e.g. a required upstream file has content the parser can't use).
+    Distinct from a plain RuntimeError, which may be a flaky opencode call/timeout
+    worth retrying. Raise this instead of RuntimeError for that kind of failure so
+    _run_stage_with_retry() fails fast instead of burning 3 retries x 60s on an error
+    that will reproduce identically every time."""
+
+
 def _run_stage_with_retry(stage_name: str, func, *args, **kwargs):
     """Run a stage function, retrying up to STAGE_RETRY_ATTEMPTS times with a
     STAGE_RETRY_SLEEP_SECONDS pause between attempts if it raises.
 
-    Covers both kinds of stage failure this pipeline produces: RuntimeError (opencode
-    exited non-zero, or _require() found a stage "did not produce" its expected output
-    file) and TimeoutError (opencode exceeded OPENCODE_TIMEOUT_SECONDS). Re-raises the
-    last exception if every attempt fails, so process_file()'s own error handling
-    (logging + sys.exit / batch "failures" list) still runs exactly as before.
+    Retries RuntimeError (opencode exited non-zero, or _require() found a stage "did
+    not produce" its expected output file) and TimeoutError (opencode exceeded
+    OPENCODE_TIMEOUT_SECONDS) — both can plausibly succeed on a later attempt.
+    StagePermanentError is NOT retried: it means the failure is deterministic given
+    the current on-disk inputs (e.g. stage_enrich() finding no parseable items in
+    extract.md), so retrying without anything changing would just fail identically
+    three times in a row. Re-raises the last exception if every attempt fails, so
+    process_file()'s own error handling (logging + sys.exit / batch "failures" list)
+    still runs exactly as before.
     """
     last_exc: Exception | None = None
     for attempt in range(1, STAGE_RETRY_ATTEMPTS + 1):
         try:
             return func(*args, **kwargs)
+        except StagePermanentError:
+            raise
         except (RuntimeError, TimeoutError) as e:
             last_exc = e
             if attempt < STAGE_RETRY_ATTEMPTS:
@@ -1057,18 +1088,10 @@ def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
         raise RuntimeError(f"--from-stage {from_stage} requires {', '.join(missing)} to already exist in {workdir}, but they don't. Run from an earlier stage first.")
 
 
-def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None:
-    run_name = audio.stem
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    logfile = LOG_DIR / f"{timestamp}_{run_name}.log"
-    setup_logging(logfile, args.verbose)
-
-    logger.info("=== Processing %s ===", audio.name)
-    logger.debug("Log file: %s", logfile)
-
-    workdir = WORK_DIR / run_name
-    workdir.mkdir(parents=True, exist_ok=True)
-
+def _run_pipeline_stages(audio: Path, workdir: Path, run_name: str, args: argparse.Namespace, from_stage: str) -> None:
+    """Run stages from_stage..pdf for one file. Each stage already retries transient
+    failures internally (_run_stage_with_retry); if a stage still fails after that, this
+    raises and lets the caller decide whether to restart the whole sequence."""
     start = STAGES.index(from_stage)
     if start > 0:
         _check_resume_prereqs(workdir, from_stage)
@@ -1095,6 +1118,39 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
         _run_stage_with_retry("verify", stage_verify, workdir, args.model_strong)
     if start <= STAGES.index("pdf"):
         _run_stage_with_retry("pdf", stage_pdf, workdir, run_name)
+
+
+def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None:
+    run_name = audio.stem
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    logfile = LOG_DIR / f"{timestamp}_{run_name}.log"
+    setup_logging(logfile, args.verbose)
+
+    logger.info("=== Processing %s ===", audio.name)
+    logger.debug("Log file: %s", logfile)
+
+    workdir = WORK_DIR / run_name
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _run_pipeline_stages(audio, workdir, run_name, args, from_stage)
+    except (RuntimeError, TimeoutError) as e:
+        # A stage exhausted its own retries. This doesn't necessarily mean the
+        # situation is truly unfixable — re-running the earlier stages from scratch can
+        # produce different (working) intermediate output, since these are LLM calls,
+        # not deterministic functions (e.g. a re-run of "extract" might phrase its
+        # output in a way that parses fine, even though the previous run's didn't). So:
+        # go back and redo the whole pipeline for this file from from_stage, one time,
+        # before giving up. Only one such restart per file, so a genuinely broken
+        # environment (bad credentials, no network, etc.) still fails after 2x the work
+        # instead of looping forever.
+        logger.warning(
+            "  Pipeline failed even after per-stage retries (%s). Restarting the whole "
+            "pipeline for %s from '%s' — one retry allowed before giving up.",
+            e, audio.name, from_stage,
+        )
+        time.sleep(STAGE_RETRY_SLEEP_SECONDS)
+        _run_pipeline_stages(audio, workdir, run_name, args, from_stage)
 
     if not args.keep_input and from_stage == "transcribe":
         try:
