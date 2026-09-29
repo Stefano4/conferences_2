@@ -122,7 +122,7 @@ OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"
 #     of loose background_batch_N.md files, since there can now be many more of them.
 #   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
 ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
-BATCH_SIZE = 10             # items per opencode call when ENRICH_MODEL is a cloud model
+BATCH_SIZE = 12             # items per opencode call when ENRICH_MODEL is a cloud model
 ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
 
 # Files each stage needs already present when resuming with --from-stage (irrelevant for
@@ -517,7 +517,7 @@ def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
     logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST)
     run_opencode(
         attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        model=GEMINI_31_LOW, logfile=workdir / "pass0.log", cwd=workdir,
+        model=GEMINI_LATEST_LOW, logfile=workdir / "pass0.log", cwd=workdir,
     )
     _require(workdir / "transcript.txt", "Pass 0")
     logger.info("  wrote %s", workdir / "transcript.txt")
