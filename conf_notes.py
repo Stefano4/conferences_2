@@ -122,7 +122,7 @@ OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"
 #     of loose background_batch_N.md files, since there can now be many more of them.
 #   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
 ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
-BATCH_SIZE = 12             # items per opencode call when ENRICH_MODEL is a cloud model
+BATCH_SIZE = 8             # items per opencode call when ENRICH_MODEL is a cloud model
 ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
 
 # Files each stage needs already present when resuming with --from-stage (irrelevant for
