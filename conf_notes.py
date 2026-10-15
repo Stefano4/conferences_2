@@ -23,11 +23,11 @@ Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — 
 work from extract.md/background.md/notes.md, which already contain everything they need,
 so the (much longer) transcript isn't re-sent to opencode on every later pass.
 
-Tool access per pass is controlled by one of three custom opencode agents (AGENT_PROFILES)
-that run_opencode() defines through OPENCODE_CONFIG_CONTENT and selects with `--agent` on
-every call. Every call's log is then audited for tools the agent should not have been able
-to use (shell, python, re-reading the attached file...) and a WARNING is printed if any
-show up, so a silently-ignored restriction can't go unnoticed again.
+Tool access per pass is controlled by one of three custom OpenCode agents (AGENT_PROFILES).
+run_opencode() writes native OpenCode v2 Markdown agent definitions under the call's
+working directory at `.opencode/agents/` and selects one with `--agent` on every call.
+Every call's log is audited for recognizable forbidden tool use and a WARNING is printed
+if any show up.
 
 Rate limits: input-token usage is estimated per call and spread over a sliding 60 s window
 (TokenThrottle, OPENCODE_TPM_BUDGET) instead of fixed sleeps; if the provider still
@@ -219,21 +219,16 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
                     items.append(item)
     return items
 
-# --- opencode agents --------------------------------------------------------------------
-# Every opencode call runs under one of these restricted agents: run_opencode() selects it
-# with `--agent <name>` and defines it through OPENCODE_CONFIG_CONTENT (see
-# opencode_config_content()). Without that, opencode uses its default `build` agent with
-# EVERY tool enabled, and a small model will happily use them (shell, python scripts, git,
-# re-reading a file that is already attached, skills, questions...), re-sending the whole
-# context on each extra step — that is what burned the token quota in the pass-0 logs.
+# --- OpenCode v2 agents ------------------------------------------------------------------
+# Each call gets native Markdown agent definitions in <cwd>/.opencode/agents/. OpenCode v2
+# reads these files from the project context; OPENCODE_CONFIG_CONTENT is not used here.
+# Keeping the profiles in Python preserves a single source of truth and lets individual
+# calls override their step cap without editing the user's global OpenCode configuration.
 #
-#   allow      the only tools the agent may use; everything else is denied. opencode gates
-#              both `write` and `edit` behind the single "edit" permission.
-#   steps      cap on the agent's tool loop (opencode then forces a plain-text answer).
-#   est_calls  how many model requests one invocation is assumed to make (each re-sends the
-#              full context) — only used by TokenThrottle for its estimate.
-#   growth     tokens each step adds to the context (web pages / tool output), for that
-#              estimate; 0 for agents that never use the web.
+#   allow      the only permission actions this agent may use; everything else is denied.
+#   steps      cap on the agent's tool loop (OpenCode then forces a plain-text answer).
+#   est_calls  how many model requests one invocation is assumed to make (for TokenThrottle).
+#   growth     tokens each step adds to the context (web pages / tool output), for that estimate.
 ALL_TOOL_KEYS = (
     "read", "edit", "glob", "grep", "list", "bash", "execute", "task", "skill",
     "webfetch", "websearch", "codesearch", "question", "todowrite", "todoread", "lsp",
@@ -241,10 +236,10 @@ ALL_TOOL_KEYS = (
 
 AGENT_PROFILES = {
     "notes-writer": {
-        "description": "Writes one fresh output file from the attached input. No read, no bash, no web.",
+        "description": "Writes one fresh output file from the attached input. No read, no shell, no web.",
         "allow": {"edit"},
-        "steps": 6,
-        "est_calls": 3,
+        "steps": 40,
+        "est_calls": 20,
         "growth": 0,
         "system": (
             "You are a text-processing assistant. The complete input is already attached to the message, so "
@@ -254,8 +249,8 @@ AGENT_PROFILES = {
         ),
     },
     # Pass 4 (pass4-verify.md) tells the model to "search the web if you need" and to rewrite
-    # notes.md IN PLACE, so this agent needs web access plus read (opencode's edit/write tools
-    # refuse to touch an existing file that wasn't read first).
+    # notes.md IN PLACE, so this agent needs web access plus read (editing an existing file
+    # may require it to be read first).
     "notes-editor": {
         "description": "Fact-checks and edits an existing file in place. Read, edit, web search/fetch only.",
         "allow": {"read", "edit", "webfetch", "websearch"},
@@ -269,7 +264,7 @@ AGENT_PROFILES = {
         ),
     },
     # Pass 2 (pass2-enrich.md): web lookups for a batch of topics, one output file.
-    # run_opencode(max_steps=, est_calls=) scale "steps"/"est_calls" with the batch size.
+    # run_opencode(max_steps=, est_calls=) scale steps/est_calls with the batch size.
     "notes-enrich": {
         "description": "Looks up topics on the web and writes a short background note. Web + edit only.",
         "allow": {"edit", "webfetch", "websearch"},
@@ -284,39 +279,50 @@ AGENT_PROFILES = {
 }
 
 
-def _build_permission(allow: set[str]) -> dict[str, str]:
-    """Default-deny permission map for one agent: "*" first, then an explicit entry per
-    known tool (opencode applies the last matching rule, and the explicit denies also
-    cover opencode versions that ignore the "*" wildcard)."""
-    perm = {"*": "deny"}
-    for tool in ALL_TOOL_KEYS:
-        perm[tool] = "allow" if tool in allow else "deny"
-    return perm
+def _v2_permission_action(action: str) -> str:
+    """Translate legacy profile labels to OpenCode v2 permission action names."""
+    return {"bash": "shell", "task": "subagent"}.get(action, action)
 
 
-def opencode_config_content(steps_override: dict[str, int] | None = None) -> str:
-    """JSON for the OPENCODE_CONFIG_CONTENT env var: our agents, merged into any config
-    already supplied through that variable. steps_override = {agent: steps} replaces an
-    agent's step cap for this one call (enrich scales it with the batch size)."""
-    agents = {
-        name: {
-            "description": p["description"],
-            "mode": "primary",
-            "prompt": p["system"],
-            "permission": _build_permission(p["allow"]),
-            "steps": (steps_override or {}).get(name, p["steps"]),
-        }
-        for name, p in AGENT_PROFILES.items()
-    }
-    config: dict = {}
-    existing = os.environ.get("OPENCODE_CONFIG_CONTENT")
-    if existing:
-        try:
-            config = json.loads(existing)
-        except ValueError:
-            logger.warning("OPENCODE_CONFIG_CONTENT is set but is not valid JSON — ignoring it")
-    config.setdefault("agent", {}).update(agents)
-    return json.dumps(config)
+def _agent_markdown(profile: dict, steps: int) -> str:
+    """Render an OpenCode v2 agent file (YAML frontmatter + system prompt body)."""
+    # Permission rules are ordered; the last matching rule wins. Deny everything first,
+    # then explicitly allow only this profile's required actions.
+    lines = [
+        "---",
+        f"description: {json.dumps(profile['description'], ensure_ascii=False)}",
+        "mode: primary",
+        f"steps: {steps}",
+        "permissions:",
+        '  - action: "*"',
+        '    resource: "*"',
+        "    effect: deny",
+    ]
+    for action in sorted({_v2_permission_action(a) for a in profile["allow"]}):
+        lines.extend([
+            f"  - action: {json.dumps(action)}",
+            '    resource: "*"',
+            "    effect: allow",
+        ])
+    lines.extend(["---", "", profile["system"], ""])
+    return "\n".join(lines)
+
+
+def write_opencode_agents(cwd: Path, steps_override: dict[str, int] | None = None) -> Path:
+    """Write native OpenCode v2 agents into cwd/.opencode/agents.
+
+    This is intentionally project-local and per-call: it doesn't mutate global OpenCode
+    configuration, and it avoids relying on OPENCODE_CONFIG_CONTENT.
+    """
+    agent_dir = cwd / ".opencode" / "agents"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    overrides = steps_override or {}
+    for name, profile in AGENT_PROFILES.items():
+        steps = int(overrides.get(name, profile["steps"]))
+        if steps < 1:
+            raise ValueError(f"agent steps must be positive, got {steps} for {name}")
+        (agent_dir / f"{name}.md").write_text(_agent_markdown(profile, steps), encoding="utf-8")
+    return agent_dir
 
 
 def derive_date_from_filename(audio: Path) -> str:
@@ -490,12 +496,17 @@ _LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
 _TOOL_LINE_PATTERNS = [
     (re.compile(r"^\$ "), "bash"),
     (re.compile(r"^⚙\s"), "execute"),
-    (re.compile(r"^[→✗✓←]\s*Skill\b"), "skill"),
-    (re.compile(r"^[→✗✓←]\s*Read\b"), "read"),
-    (re.compile(r"^[→✗✓←]\s*Glob\b"), "glob"),
-    (re.compile(r"^[→✗✓←]\s*Grep\b"), "grep"),
-    (re.compile(r"^[→✗✓←]\s*List\b"), "list"),
-    (re.compile(r"^[→✗✓←]?\s*Asked \d+ question"), "question"),
+    (re.compile(r"^[→✗✓←]\s*Skill\b", re.I), "skill"),
+    (re.compile(r"^[→✗✓←]\s*Read\b", re.I), "read"),
+    (re.compile(r"^[→✗✓←]\s*Edit\b|^[→✗✓←]\s*Write\b|^[→✗✓←]\s*Patch\b", re.I), "edit"),
+    (re.compile(r"^[→✗✓←]\s*Glob\b", re.I), "glob"),
+    (re.compile(r"^[→✗✓←]\s*Grep\b", re.I), "grep"),
+    (re.compile(r"^[→✗✓←]\s*List\b", re.I), "list"),
+    (re.compile(r"^[→✗✓←]\s*Shell\b", re.I), "bash"),
+    (re.compile(r"^[→✗✓←]\s*WebSearch\b", re.I), "websearch"),
+    (re.compile(r"^[→✗✓←]\s*WebFetch\b", re.I), "webfetch"),
+    (re.compile(r"^[→✗✓←]\s*(?:TodoWrite|TodoRead|LSP|Task)\b", re.I), "other"),
+    (re.compile(r"^[→✗✓←]?\s*Asked \d+ question", re.I), "question"),
 ]
 
 
@@ -509,14 +520,13 @@ def _audit_log(agent: str, log_text: str) -> Counter:
         line = _LOG_TS_RE.sub("", _ANSI_RE.sub("", raw)).strip()
         for pattern, key in _TOOL_LINE_PATTERNS:
             if pattern.match(line):
-                if key not in allowed:
+                if key == "other" or key not in allowed:
                     used[key] += 1
                 break
     if used:
         logger.warning(
             "  agent '%s' used tools it should not have: %s — the permission restrictions were NOT "
-            "enforced. Check the opencode version's agent/permission config schema (see "
-            "opencode_config_content()) and the call log.",
+            "enforced. Check the OpenCode v2 agent/permission configuration and the call log.",
             agent, ", ".join(f"{k}×{v}" for k, v in used.items()),
         )
     return used
@@ -548,7 +558,7 @@ def run_opencode(
     max_steps: int | None = None, est_calls: int | None = None, read_files: list[Path] | None = None,
 ) -> None:
     """Invoke opencode non-interactively under one of the restricted AGENT_PROFILES:
-    opencode run --agent <agent> --file f1 --file f2 --model <provider/model> --thinking --auto "<prompt>"
+    opencode run --agent <agent> --file f1 --file f2 --model <provider/model> --auto "<prompt>"
 
     `agent` is mandatory on purpose: a call that forgets it would silently get opencode's
     default all-tools agent again. Before launching, the call is paced by TokenThrottle
@@ -576,27 +586,29 @@ def run_opencode(
     for key, value in (substitutions or {}).items():
         prompt_text = prompt_text.replace(key, value)
 
-    # OpenCode run does not support a --dir flag in the installed CLI version.
-    # Run the process with cwd=WORK_DIR and align PWD so OpenCode resolves its
-    # project root and all relative paths from the intended working directory.
+    # OpenCode run in the installed CLI has no --dir flag. Set cwd and PWD to the
+    # call directory so relative file operations and the local .opencode agent files
+    # are resolved from the intended workspace.
     cmd = ["opencode", "run", "--agent", agent]
     for p in attachments:
         cmd += ["--file", str(p)]
     if model:
         cmd += ["--model", model]
-    cmd += ["--thinking"]
-    # Extra flags for opencode itself (e.g. --log-level DEBUG). Varies by opencode
-    # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level DEBUG"
+    # Extra flags for OpenCode itself (e.g. --log-level debug). Keep opt-in because
+    # supported flags vary by CLI version: export OPENCODE_EXTRA_ARGS="--log-level debug"
     cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
     cmd += ["--auto", prompt_text]
 
     env = os.environ.copy()
     # Enable opencode's web search integration for the enrichment pass.
     env.setdefault("OPENCODE_ENABLE_EXA", "1")
-    # Define our restricted agents for this call (merged into any config already in the env).
-    env["OPENCODE_CONFIG_CONTENT"] = opencode_config_content({agent: max_steps} if max_steps else None)
-    # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both
-    # aligned so all relative writes land in the requested WORK_DIR/run directory.
+    # OpenCode v2 discovers Markdown agents from .opencode/agents/. Write them before
+    # launching and override only the selected agent's step cap for this call.
+    write_opencode_agents(cwd, {agent: max_steps} if max_steps else None)
+    # Do not rely on this legacy inline-config variable; it is not the v2 agent-loading
+    # mechanism. Remove an inherited value so behavior is deterministic.
+    env.pop("OPENCODE_CONFIG_CONTENT", None)
+    # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both aligned.
     env["PWD"] = str(cwd.resolve())
 
     if not (model or "").startswith("ollama/"):  # local models have no cloud TPM limit
