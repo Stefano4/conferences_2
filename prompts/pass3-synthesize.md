@@ -13,13 +13,13 @@ this step).
 CRITICAL RULE — DO NOT SUMMARIZE OR FILTER: your job is to combine
 and connect the material summing up information, not to condense it.
 Every sentence in each extract.md's "Speaker's claims & arguments" numbered
-item should be reported in notes-draft.md. 
+item should be reported in notes.md. 
 
 Do not merge two distinct sentences into one to save space, even if they
 are closely related so no individual statement is absorbed into another.
 Also every topic, named entity, claim, 
-and caveat present in extract.md must appear in notes-draft.md, and every
-entry in background.md should appear in notes-draft.md. You are reorganizing
+and caveat present in extract.md must appear in notes.md, and every
+entry in background.md should appear in notes.md. You are reorganizing
 and writing connective prose around the full content, never compressing it
 down or leaving things out because they seem minor or redundant. If two
 items overlap, include both rather than merging away detail. 
@@ -27,7 +27,7 @@ If this means the notes run long, that is correct and expected:
 length is not a target to minimize, and a shorter document is not 
 a better one here.
 
-- Never write "..." anywhere in notes-draft.md, for any reason. "..." is
+- Never write "..." anywhere in notes.md, for any reason. "..." is
   always a sign that content is being dropped, and content must never be
   dropped in this pass.
 - Length check: extract.md's "Speaker's claims & arguments" section is
@@ -40,7 +40,7 @@ a better one here.
 - Before finishing, go back through extract.md's "Speaker's claims &
   arguments" numbered items one by one, and separately through every entry
   in background.md, and confirm each has a clear counterpart somewhere in
-  notes-draft.md. If you find one that doesn't, add it before moving on —
+  notes.md. If you find one that doesn't, add it before moving on —
   do not treat a missing item as acceptable because the surrounding prose
   already "covers the gist" of it.
 - Use Bold, italics, and underlining text as a skilled academic PhD student to make the notes more readable
@@ -57,7 +57,7 @@ metadata" section states an official session title, use that instead of
 generating one.
 **Data:** {{DATA}}
 
-The {{DATA}} placeholder above is filled in for you before this prompt
+The date above is filled in for you before this prompt
 reaches you — use it exactly as given, verbatim, and do not try to
 re-derive, override, or second-guess it from extract.md. Speakers
 rarely state the date out loud, so this value comes from the recording's

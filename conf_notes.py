@@ -5,11 +5,14 @@ turns each into a transcript PDF, a notes markdown file, a notes HTML file, and 
 PDF (4 files per recording).
 
 Transcription is done locally with mlx-whisper (no cloud calls, no API key needed). The
-raw transcript is first lightly cleaned up by opencode (forced onto a local model — see
-GEMINI_MODEL_2 — so this pass stays fully offline too), then that cleaned transcript
-feeds a 4-pass opencode pipeline:
-  0. cleanup     — de-dupe/de-hallucinate raw whisper output, drop filler repeats, fix
-                   obvious typos. No content removed, nothing paraphrased.
+raw transcript is first cleaned by pass 0 (a deterministic loop-remover in plain Python,
+then a chunked, validated opencode pass — see stage_cleanup()), then that cleaned
+transcript feeds a 4-pass opencode pipeline:
+  0. cleanup     — (a) Python collapses exact whisper loops, no LLM; (b) the text is split
+                   into ~2000-word chunks, each cleaned by one small opencode call
+                   (filler repeats, obvious typos) and VALIDATED in code before it is
+                   accepted; a chunk that never validates keeps its un-cleaned text, so
+                   nothing is ever dropped. Finished chunks are reused on re-runs.
   1. extract     — pull claims/topics/quotes from the cleaned transcript only.
   2. enrich      — look up each topic across free, no-key sources (opencode's hosted
                    websearch tool — see run_opencode()'s OPENCODE_ENABLE_EXA note).
@@ -20,11 +23,15 @@ Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — 
 work from extract.md/background.md/notes.md, which already contain everything they need,
 so the (much longer) transcript isn't re-sent to opencode on every later pass.
 
-Tool access per pass is controlled by one of three custom opencode agents this script
-defines and injects via OPENCODE_CONFIG_CONTENT on every call (see OPENCODE_AGENTS below)
-— opencode's permission model gates `write` and `edit` behind the same "edit" permission
-key, so a pi-style write-only tool restriction isn't expressible; "notes-writer" (edit
-only) is the closest equivalent.
+Tool access per pass is controlled by one of three custom opencode agents (AGENT_PROFILES)
+that run_opencode() defines through OPENCODE_CONFIG_CONTENT and selects with `--agent` on
+every call. Every call's log is then audited for tools the agent should not have been able
+to use (shell, python, re-reading the attached file...) and a WARNING is printed if any
+show up, so a silently-ignored restriction can't go unnoticed again.
+
+Rate limits: input-token usage is estimated per call and spread over a sliding 60 s window
+(TokenThrottle, OPENCODE_TPM_BUDGET) instead of fixed sleeps; if the provider still
+answers "quota exceeded", the "retry in Ns" hint in its error is honoured.
 
 Folder layout (created automatically next to the script if missing):
   input/   — drop recordings here; processed files move to input/processed/ so reruns
@@ -52,6 +59,7 @@ Usage:
 
 from __future__ import annotations
 import argparse, html, json, logging, os, re, select, shutil, signal, subprocess, sys, time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -103,10 +111,10 @@ AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".m
 # `opencode auth login` for Gemini/Google AI Studio, and "ollama" assumes a local Ollama
 # server serving the tag after the slash — adjust both prefixes to match your setup.
 #
-# Pass 0 (cleanup) is light, mechanical work (de-dupe/de-hallucinate/typo-fix, no real
-# reasoning about content) so it's forced onto a local model instead of --model-fast —
-# it never leaves the machine and doesn't spend cloud-model budget on a pass that
-# doesn't need a strong model. See stage_cleanup(), which always passes this model.
+# Pass 0 (cleanup) has its own model, CLEANUP_MODEL (defined below), independent of
+# --model-fast. NOTE: GEMINI_LATEST* are HOSTED Google models, not local ones — only
+# LOCAL_MODEL (ollama/...) runs on this machine. Override with --model-cleanup or the
+# OPENCODE_MODEL_CLEANUP env var.
 GEMINI_LATEST = "google/gemini-flash-lite-latest"
 GEMINI_LATEST_LOW = "google/gemini-flash-lite-latest#low"
 GEMINI_31_LOW = "google/gemini-3.1-flash-lite#low"
@@ -124,6 +132,25 @@ OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"
 ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
 BATCH_SIZE = 8             # items per opencode call when ENRICH_MODEL is a cloud model
 ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
+
+# --- Pass 0 (cleanup) and rate-limit settings -------------------------------------------
+CLEANUP_MODEL = os.environ.get("OPENCODE_MODEL_CLEANUP", GEMINI_LATEST_LOW)
+CLEANUP_CHUNK_WORDS = int(os.environ.get("CLEANUP_CHUNK_WORDS", "2000"))  # words per LLM call
+CLEANUP_CHUNK_ATTEMPTS = 3        # valid-output attempts per chunk before falling back to un-cleaned text
+CLEANUP_MIN_WORD_RATIO = 0.85     # accepted output must keep >= this share of the chunk's words ...
+CLEANUP_MAX_WORD_RATIO = 1.03     # ... and not grow by more than this
+CLEANUP_MAX_NOVEL_RATIO = 0.03    # max share of output words that don't occur in the input chunk
+
+RATE_LIMIT_MAX_WAITS = 6          # "retry in Ns" waits tolerated per chunk before giving up
+RATE_LIMIT_MAX_WAIT_SECONDS = 300 # a longer hint than this means a daily quota: waiting won't help
+
+# Input-token budget per rolling 60 s, used by TokenThrottle to pace calls to a hosted
+# model. Keep it below the provider's real limit (Google free tier: 250K/min) because the
+# per-call estimate is rough. 0 disables throttling. Local (ollama/...) models are never throttled.
+TPM_BUDGET = int(os.environ.get("OPENCODE_TPM_BUDGET", "200000"))
+CHARS_PER_TOKEN = 3.0             # rough figure for Italian text
+VERIFY_MAX_SHRINK = 0.10          # pass 4 may not shrink notes.md by more than this share of its words
+AGENT_BASE_TOKENS = 3000          # system prompt + tool definitions of the restricted agents
 
 # Files each stage needs already present when resuming with --from-stage (irrelevant for
 # a normal full run, where the prior stage just wrote them).
@@ -192,26 +219,105 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
                     items.append(item)
     return items
 
+# --- opencode agents --------------------------------------------------------------------
+# Every opencode call runs under one of these restricted agents: run_opencode() selects it
+# with `--agent <name>` and defines it through OPENCODE_CONFIG_CONTENT (see
+# opencode_config_content()). Without that, opencode uses its default `build` agent with
+# EVERY tool enabled, and a small model will happily use them (shell, python scripts, git,
+# re-reading a file that is already attached, skills, questions...), re-sending the whole
+# context on each extra step — that is what burned the token quota in the pass-0 logs.
+#
+#   allow      the only tools the agent may use; everything else is denied. opencode gates
+#              both `write` and `edit` behind the single "edit" permission.
+#   steps      cap on the agent's tool loop (opencode then forces a plain-text answer).
+#   est_calls  how many model requests one invocation is assumed to make (each re-sends the
+#              full context) — only used by TokenThrottle for its estimate.
+#   growth     tokens each step adds to the context (web pages / tool output), for that
+#              estimate; 0 for agents that never use the web.
+ALL_TOOL_KEYS = (
+    "read", "edit", "glob", "grep", "list", "bash", "execute", "task", "skill",
+    "webfetch", "websearch", "codesearch", "question", "todowrite", "todoread", "lsp",
+)
+
 AGENT_PROFILES = {
     "notes-writer": {
-        "description": "Writes fresh pipeline output files. No read, no bash, no web.",
-        "mode": "primary",
-        "permissions": {"edit": "allow", "read": "deny", "bash": "deny", "webfetch": "deny", "websearch": "deny", "todowrite": "deny"},
-        "system": "You are a precise writing assistant. Produce only the requested output file, using the content supplied in the message. Do not invent or paraphrase content."
+        "description": "Writes one fresh output file from the attached input. No read, no bash, no web.",
+        "allow": {"edit"},
+        "steps": 6,
+        "est_calls": 3,
+        "growth": 0,
+        "system": (
+            "You are a text-processing assistant. The complete input is already attached to the message, so "
+            "never read, list, search or run anything. Follow the instructions in the message exactly: write "
+            "the requested output file with the file-writing tool, containing only the requested text, then "
+            "answer with one short line and stop. Do not put commentary, notes or headers of your own in the file."
+        ),
     },
+    # Pass 4 (pass4-verify.md) tells the model to "search the web if you need" and to rewrite
+    # notes.md IN PLACE, so this agent needs web access plus read (opencode's edit/write tools
+    # refuse to touch an existing file that wasn't read first).
     "notes-editor": {
-        "description": "Edits an existing file in place. Read + edit only, no bash, no web.",
-        "mode": "primary",
-        "permissions": {"edit": "allow", "read": "allow", "bash": "deny", "webfetch": "deny", "websearch": "deny", "todowrite": "deny"},
-        "system": "You are a careful editor. Read the file you are asked to edit, then apply only the requested annotations or corrections. Do not remove content."
+        "description": "Fact-checks and edits an existing file in place. Read, edit, web search/fetch only.",
+        "allow": {"read", "edit", "webfetch", "websearch"},
+        "steps": 40,
+        "est_calls": 20,
+        "growth": 2000,
+        "system": (
+            "You are a careful fact-checking editor. Start by reading the file you are asked to check. You may "
+            "search the web to check doubtful facts. Apply only the corrections the message asks for, in place, "
+            "and never remove content. Do not run commands or read any other local file."
+        ),
     },
+    # Pass 2 (pass2-enrich.md): web lookups for a batch of topics, one output file.
+    # run_opencode(max_steps=, est_calls=) scale "steps"/"est_calls" with the batch size.
     "notes-enrich": {
-        "description": "Looks up a topic on the web and writes a short background note.",
-        "mode": "primary",
-        "permissions": {"edit": "allow", "read": "allow", "bash": "deny", "webfetch": "allow", "websearch": "allow", "todowrite": "deny"},
-        "system": "You are a research assistant. For each topic listed, search the web for reliable background information and write a concise note. Cite sources where possible."
+        "description": "Looks up topics on the web and writes a short background note. Web + edit only.",
+        "allow": {"edit", "webfetch", "websearch"},
+        "steps": 40,
+        "est_calls": 20,
+        "growth": 2000,
+        "system": (
+            "You are a research assistant. Follow the instructions in the message: look up every listed topic "
+            "on the web, and write the result to the requested file. Do not run commands or read local files."
+        ),
     },
 }
+
+
+def _build_permission(allow: set[str]) -> dict[str, str]:
+    """Default-deny permission map for one agent: "*" first, then an explicit entry per
+    known tool (opencode applies the last matching rule, and the explicit denies also
+    cover opencode versions that ignore the "*" wildcard)."""
+    perm = {"*": "deny"}
+    for tool in ALL_TOOL_KEYS:
+        perm[tool] = "allow" if tool in allow else "deny"
+    return perm
+
+
+def opencode_config_content(steps_override: dict[str, int] | None = None) -> str:
+    """JSON for the OPENCODE_CONFIG_CONTENT env var: our agents, merged into any config
+    already supplied through that variable. steps_override = {agent: steps} replaces an
+    agent's step cap for this one call (enrich scales it with the batch size)."""
+    agents = {
+        name: {
+            "description": p["description"],
+            "mode": "primary",
+            "prompt": p["system"],
+            "permission": _build_permission(p["allow"]),
+            "steps": (steps_override or {}).get(name, p["steps"]),
+        }
+        for name, p in AGENT_PROFILES.items()
+    }
+    config: dict = {}
+    existing = os.environ.get("OPENCODE_CONFIG_CONTENT")
+    if existing:
+        try:
+            config = json.loads(existing)
+        except ValueError:
+            logger.warning("OPENCODE_CONFIG_CONTENT is set but is not valid JSON — ignoring it")
+    config.setdefault("agent", {}).update(agents)
+    return json.dumps(config)
+
 
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
@@ -321,19 +427,148 @@ def ensure_no_long_lines(path: Path, max_bytes: int = OPENCODE_READ_LINE_LIMIT_B
     logger.debug("  rewrapped long line(s) in %s to stay under the ~%dKB read-line safety margin", path.name, max_bytes // 1000)
 
 
+class OpencodeRateLimit(RuntimeError):
+    """opencode exited non-zero because the provider rejected the call for quota / rate-limit
+    reasons. `retry_after` is the delay in seconds the provider asked for, parsed from its
+    error message (60 when the message named none)."""
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class TokenThrottle:
+    """Keep estimated input tokens under `budget` per rolling 60 seconds by sleeping before
+    a call when needed. Replaces the old fixed `sleep(30/60)` calls between stages: the wait
+    now depends on what was actually sent, so small calls aren't delayed and a burst of
+    chunk calls is spaced out just enough."""
+
+    def __init__(self, budget_per_minute: int):
+        self.budget = budget_per_minute
+        self.events: list[tuple[float, int]] = []
+
+    def wait_for(self, tokens: int) -> None:
+        if self.budget <= 0:
+            return
+        tokens = min(tokens, self.budget)  # a single call bigger than the budget can't be helped
+        while True:
+            now = time.monotonic()
+            self.events = [(t, n) for t, n in self.events if now - t < 60]
+            used = sum(n for _, n in self.events)
+            if used + tokens <= self.budget:
+                break
+            wait = 60 - (now - self.events[0][0]) + 0.5
+            logger.info("  throttle: ~%dK tokens sent in the last 60s (budget %dK) — waiting %.0fs",
+                        used // 1000, self.budget // 1000, wait)
+            time.sleep(max(wait, 1.0))
+        self.events.append((time.monotonic(), tokens))
+
+    def reset(self) -> None:
+        """Forget the window (call after having slept out a provider-requested delay)."""
+        self.events.clear()
+
+
+THROTTLE = TokenThrottle(TPM_BUDGET)
+
+
+def _estimate_tokens(files: list[Path], prompt_text: str, agent: str, est_calls: int | None) -> int:
+    """Rough input-token total for one invocation: every request re-sends the prompt plus
+    the files in context, and web-capable agents also accumulate `growth` tokens of tool
+    output per step (so cost grows with the square of the number of steps)."""
+    profile = AGENT_PROFILES[agent]
+    calls = est_calls or profile["est_calls"]
+    chars = len(prompt_text) + sum(p.stat().st_size for p in files if p.exists())
+    per_call = chars / CHARS_PER_TOKEN + AGENT_BASE_TOKENS
+    return int(per_call * calls + profile["growth"] * calls * (calls - 1) / 2)
+
+
+# Lines opencode prints when it uses a tool, mapped to the permission key they correspond
+# to. Matched against the (ANSI-stripped, timestamp-stripped) lines of a call's log by
+# _audit_log(). Best effort: it only knows the line shapes seen in real logs.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
+_TOOL_LINE_PATTERNS = [
+    (re.compile(r"^\$ "), "bash"),
+    (re.compile(r"^⚙\s"), "execute"),
+    (re.compile(r"^[→✗✓←]\s*Skill\b"), "skill"),
+    (re.compile(r"^[→✗✓←]\s*Read\b"), "read"),
+    (re.compile(r"^[→✗✓←]\s*Glob\b"), "glob"),
+    (re.compile(r"^[→✗✓←]\s*Grep\b"), "grep"),
+    (re.compile(r"^[→✗✓←]\s*List\b"), "list"),
+    (re.compile(r"^[→✗✓←]?\s*Asked \d+ question"), "question"),
+]
+
+
+def _audit_log(agent: str, log_text: str) -> Counter:
+    """Warn if the call used tools its agent is not allowed to — i.e. if opencode did not
+    actually apply AGENT_PROFILES (wrong config keys for this opencode version, agent name
+    unknown, ...). Returns the Counter of offending tools (empty when all is well)."""
+    allowed = AGENT_PROFILES[agent]["allow"]
+    used: Counter = Counter()
+    for raw in log_text.splitlines():
+        line = _LOG_TS_RE.sub("", _ANSI_RE.sub("", raw)).strip()
+        for pattern, key in _TOOL_LINE_PATTERNS:
+            if pattern.match(line):
+                if key not in allowed:
+                    used[key] += 1
+                break
+    if used:
+        logger.warning(
+            "  agent '%s' used tools it should not have: %s — the permission restrictions were NOT "
+            "enforced. Check the opencode version's agent/permission config schema (see "
+            "opencode_config_content()) and the call log.",
+            agent, ", ".join(f"{k}×{v}" for k, v in used.items()),
+        )
+    return used
+
+
+_RETRY_HINT_RES = [
+    re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.I),
+    re.compile(r"retryDelay\W{1,6}([0-9]+(?:\.[0-9]+)?)s", re.I),
+]
+_QUOTA_RE = re.compile(r"quota|rate.?limit|RESOURCE_EXHAUSTED|\b429\b|too many requests", re.I)
+
+
+def _rate_limit_from_log(log_text: str) -> float | None:
+    """If the end of the log looks like a quota/rate-limit rejection, return the delay to wait
+    in seconds (60 if the provider didn't say), else None."""
+    tail = "\n".join(log_text.splitlines()[-40:])
+    if not _QUOTA_RE.search(tail):
+        return None
+    for pattern in _RETRY_HINT_RES:
+        m = pattern.search(tail)
+        if m:
+            return float(m.group(1))
+    return 60.0
+
+
 def run_opencode(
     *, attachments: list[Path], prompt_file: Path, model: str | None,
-    logfile: Path, cwd: Path, substitutions: dict[str, str] | None = None,
+    logfile: Path, cwd: Path, agent: str, substitutions: dict[str, str] | None = None,
+    max_steps: int | None = None, est_calls: int | None = None, read_files: list[Path] | None = None,
 ) -> None:
-    """Invoke opencode non-interactively:
-    opencode run --file f1 --file f2 --model <provider/model> --auto "<prompt>"
+    """Invoke opencode non-interactively under one of the restricted AGENT_PROFILES:
+    opencode run --agent <agent> --file f1 --file f2 --model <provider/model> --thinking --auto "<prompt>"
 
-    No custom agent is selected: every call uses opencode's normal/default agent.
+    `agent` is mandatory on purpose: a call that forgets it would silently get opencode's
+    default all-tools agent again. Before launching, the call is paced by TokenThrottle
+    (hosted models only). After it, the log is audited for forbidden tool use, and a
+    quota / rate-limit failure is raised as OpencodeRateLimit carrying the provider's
+    "retry in Ns" delay so callers can wait exactly that long.
 
     We set the subprocess cwd explicitly to `workdir` (opencode resolves relative file
     operations like "write to extract.md" against its own process cwd), and pass --auto
-    so a headless run never blocks waiting for an interactive permission prompt.
+    so a headless run never blocks waiting for an interactive permission prompt. Keep a
+    flag between the last --file and the prompt (here: --auto): --file takes several
+    values and could otherwise swallow the prompt.
+
+    Optional per-call tuning: max_steps overrides the agent's step cap, est_calls its assumed
+    number of requests, and read_files lists files the agent will `read` itself (not attached)
+    so the throttle's token estimate still counts them.
     """
+    if agent not in AGENT_PROFILES:
+        raise ValueError(f"unknown opencode agent {agent!r}; expected one of {sorted(AGENT_PROFILES)}")
+
     prompt_text = prompt_file.read_text()
     # Fill in values the script already knows (e.g. the talk's date, derived from the
     # filename) instead of leaving opencode to infer them from the transcript, which is
@@ -344,28 +579,40 @@ def run_opencode(
     # OpenCode run does not support a --dir flag in the installed CLI version.
     # Run the process with cwd=WORK_DIR and align PWD so OpenCode resolves its
     # project root and all relative paths from the intended working directory.
-    cmd = ["opencode", "run"]
+    cmd = ["opencode", "run", "--agent", agent]
     for p in attachments:
         cmd += ["--file", str(p)]
     if model:
         cmd += ["--model", model]
-    cmd += ["--auto", prompt_text]
     cmd += ["--thinking"]
-    cmd += [" --log - level DEBUG"]
-    # Extra flags for opencode itself (e.g. --log-level debug). Varies by opencode
-    # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level debug"
+    # Extra flags for opencode itself (e.g. --log-level DEBUG). Varies by opencode
+    # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level DEBUG"
     cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
+    cmd += ["--auto", prompt_text]
 
     env = os.environ.copy()
     # Enable opencode's web search integration for the enrichment pass.
     env.setdefault("OPENCODE_ENABLE_EXA", "1")
+    # Define our restricted agents for this call (merged into any config already in the env).
+    env["OPENCODE_CONFIG_CONTENT"] = opencode_config_content({agent: max_steps} if max_steps else None)
     # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both
     # aligned so all relative writes land in the requested WORK_DIR/run directory.
     env["PWD"] = str(cwd.resolve())
 
+    if not (model or "").startswith("ollama/"):  # local models have no cloud TPM limit
+        estimate = _estimate_tokens(attachments + (read_files or []), prompt_text, agent, est_calls)
+        if 0 < THROTTLE.budget < estimate:
+            logger.warning(
+                "  this call alone is estimated at ~%dK input tokens, above the %dK/min budget — "
+                "expect a full-minute wait before it, and a provider rate limit if the real limit is as low. "
+                "Consider a smaller batch (BATCH_SIZE) or a higher-quota model.",
+                estimate // 1000, THROTTLE.budget // 1000,
+            )
+        THROTTLE.wait_for(estimate)
+
     logger.info(
-        "Running opencode (cwd=%s): opencode run %s ...%s",
-        cwd, " ".join(f"--file {p.name}" for p in attachments), f" --model {model}" if model else "",
+        "Running opencode (cwd=%s): opencode run --agent %s %s ...%s",
+        cwd, agent, " ".join(f"--file {p.name}" for p in attachments), f" --model {model}" if model else "",
     )
 
     # Stream instead of subprocess.run(): piping stdout straight into logfile with a raw
@@ -444,7 +691,16 @@ def run_opencode(
     except (ProcessLookupError, PermissionError):
         pass
 
+    log_text = logfile.read_text(errors="replace")
+    _audit_log(agent, log_text)
+
     if returncode != 0:
+        retry_after = _rate_limit_from_log(log_text)
+        if retry_after is not None:
+            raise OpencodeRateLimit(
+                f"opencode call hit a provider quota/rate limit (exit {returncode}, retry in ~{retry_after:.0f}s). "
+                f"See {logfile} for details.", retry_after,
+            )
         raise RuntimeError(f"opencode call failed (exit {returncode}). See {logfile} for details.")
 
 
@@ -494,43 +750,327 @@ def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
     logger.info("  wrote %s (%d words)", out, len(text.split()))
 
 
-def stage_cleanup(workdir: Path, model_fast: str | None) -> None:
-    """Light opencode pass over the raw whisper output: drop duplicated/hallucinated
-    lines and repeated filler ("grazie grazie", "buongiorno buongiorno", ...), fix
-    obvious mis-transcription typos — nothing summarized, nothing reworded, no content
-    removed. Writes transcript.txt, which every later stage (extract, and the final
-    transcript PDF) actually consumes.
+# --- Pass 0: cleanup ---------------------------------------------------------------------
+# The cleanup rules live in prompts/pass0-cleanup.md (single source of truth, edit them
+# there). It was written for a whole-file run ("transcript-raw.txt" in, "transcript.txt"
+# out), so for each chunk _render_cleanup_prompt() prepends a short note and swaps those two
+# file names for the chunk's own input/output files; the rules themselves are untouched.
 
-    model_fast is accepted (and used by every other stage) but deliberately ignored
-    here: cleanup is forced onto GEMINI_MODEL_2 since this pass is mechanical enough not
-    to need a cloud model and runs fully offline via ollama.
+# Greetings / thanks / fillers named in pass 0's rule 2. Immediate duplicates of these
+# ("grazie grazie", "ecco ecco") are collapsed in Python, with no LLM involved.
+_FILLER_KEYS = {"grazie", "buongiorno", "buonasera", "salve", "ciao", "ecco", "cioè", "diciamo"}
 
-    Uses opencode's default agent (edit only, no read/bash/web): --file already embeds
-    transcript-raw.txt's full content inline in the message opencode sends the model, so
-    the model never needs to fetch it again. Granting `read` anyway invites a small
-    local model to redundantly re-read a file it already has in full — and per
-    OPENCODE_READ_LINE_LIMIT_BYTES's comment, opencode's own `read` tool may have a
-    similar per-line cap to pi's ~50KB one, so on a long transcript that self-read could
-    come back truncated and the model "cleans" only what it got. Denying `read` in the
-    agent closes that path outright.
+_EDGE_PUNCT = ".,;:!?…\"'«»“”‘’()[]{}—–-"
+_WORD_RE = re.compile(r"\w+(?:['’]\w+)*", re.UNICODE)
+
+
+def _norm_word(word: str) -> str:
+    return word.strip(_EDGE_PUNCT).casefold()
+
+
+_TRAIL_PUNCT_RE = re.compile(r"[.,;:!?…»”’)\]]+$")
+
+
+def _with_tail_of(token: str, donor: str) -> str:
+    """`token` with its trailing punctuation replaced by the donor's ("grazie" + "grazie." -> "grazie.")."""
+    tail = _TRAIL_PUNCT_RE.search(token)
+    stem = token[:tail.start()] if tail else token
+    donor_tail = _TRAIL_PUNCT_RE.search(donor)
+    return stem + (donor_tail.group(0) if donor_tail else "")
+
+
+def _collapse_runs(keys: list[str], max_n: int, min_reps) -> tuple[list[int], dict[int, int]]:
+    """(indices to KEEP, {kept index: index of the run's last item}) after collapsing immediately repeated blocks of items in `keys`.
+
+    At each position every block size n (1..max_n) is tried; a block counts if it repeats
+    back to back at least min_reps(block) times. Among those, the one covering the most
+    items wins (shortest block on ties, so "A A A A" collapses via n=1 and "A B A B A B"
+    via n=2), and the whole run is reduced to its first copy. Blocks containing an empty
+    key (blank line / bare punctuation) are never treated as repeats.
     """
-    logger.info("[2/7] Pass 0: transcript cleanup (de-dupe/de-hallucinate, no content dropped, local model=%s)", GEMINI_LATEST)
-    run_opencode(
-        attachments=[workdir / "transcript-raw.txt"], prompt_file=PROMPTS_DIR / "pass0-cleanup.md",
-        model=GEMINI_LATEST_LOW, logfile=workdir / "pass0.log", cwd=workdir,
+    keep: list[int] = []
+    tail_from: dict[int, int] = {}
+    i, total = 0, len(keys)
+    while i < total:
+        best: tuple[int, int] | None = None  # (items covered, block size)
+        for n in range(1, min(max_n, (total - i) // 2) + 1):
+            block = keys[i:i + n]
+            if any(k == "" for k in block):
+                continue
+            reps = 1
+            while keys[i + reps * n: i + (reps + 1) * n] == block:
+                reps += 1
+            if reps >= min_reps(block) and (best is None or reps * n > best[0]):
+                best = (reps * n, n)
+        if best is None:
+            keep.append(i)
+            i += 1
+        else:
+            keep.extend(range(i, i + best[1]))  # first copy only ...
+            tail_from[i + best[1] - 1] = i + best[0] - 1  # ... but it ends like the LAST copy did
+            i += best[0]
+    return keep, tail_from
+
+
+def collapse_repeats(text: str) -> tuple[str, int]:
+    """Deterministic removal of Whisper loops — no LLM involved. Returns (text, words_removed).
+
+    Deliberately conservative, because anything removed here is gone for good:
+      * whole lines (or groups of up to 4 lines) repeated back to back: collapsed when the
+        block has >= 4 words and appears twice; shorter blocks only from 5 copies on;
+      * inside a line, a phrase of >= 3 words repeated back to back (2 copies), a 2-word
+        phrase (3 copies) or a single word (5 copies) — so ordinary speech patterns like
+        "piano piano" or "no, no" are left alone for the LLM / the reader. The one exception
+        is the greeting/thanks/filler words of _FILLER_KEYS ("grazie grazie", "salve salve",
+        "ecco ecco"...), which collapse from 2 copies on (pass 0's rule 2).
+    Comparison ignores case and edge punctuation; the surviving copy keeps its original text.
+    """
+    lines = text.split("\n")
+    words_before = sum(len(line.split()) for line in lines)
+
+    line_keys = [" ".join(_norm_word(w) for w in line.split()) for line in lines]
+    keep, _ = _collapse_runs(line_keys, 4, lambda block: 2 if sum(len(k.split()) for k in block) >= 4 else 5)
+    lines = [lines[i] for i in keep]
+
+    out = []
+    for line in lines:
+        tokens = line.split()
+        if len(tokens) < 2:
+            out.append(line)
+            continue
+        keep, tail_from = _collapse_runs(
+            [_norm_word(t) for t in tokens], 12,
+            lambda block: 2 if len(block) == 1 and block[0] in _FILLER_KEYS else {1: 5, 2: 3}.get(len(block), 2),
+        )
+        if len(keep) == len(tokens):
+            out.append(line)
+            continue
+        # The surviving copy keeps its own words but takes the punctuation that ended the
+        # collapsed run, so "grazie grazie. Ecco" becomes "grazie. Ecco", not "grazie Ecco".
+        out.append(" ".join(_with_tail_of(tokens[i], tokens[tail_from[i]]) if i in tail_from else tokens[i] for i in keep))
+
+    result = "\n".join(out)
+    return result, words_before - sum(len(line.split()) for line in out)
+
+
+def _split_into_chunks(lines: list[str], target_words: int) -> list[list[str]]:
+    """Group consecutive lines into chunks of roughly target_words words, breaking only at
+    line boundaries (a pathological single line longer than target is split at spaces)."""
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_words = 0
+    for line in lines:
+        n = len(line.split())
+        if n > target_words:
+            if current:
+                chunks.append(current)
+                current, current_words = [], 0
+            words = line.split()
+            for j in range(0, len(words), target_words):
+                chunks.append([" ".join(words[j:j + target_words])])
+            continue
+        if current and current_words + n > target_words:
+            chunks.append(current)
+            current, current_words = [], 0
+        current.append(line)
+        current_words += n
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def validate_cleanup_chunk(src: str, out: str) -> list[str]:
+    """Reasons why `out` is not an acceptable cleaned version of `src` (empty list = OK)."""
+    if not out.strip():
+        return ["output is empty"]
+    src_words = [w.casefold() for w in _WORD_RE.findall(src)]
+    out_words = [w.casefold() for w in _WORD_RE.findall(out)]
+    if not src_words:
+        return []
+    problems = []
+    if not out_words:
+        return ["output has no words"]
+
+    ratio = len(out_words) / len(src_words)
+    if ratio < CLEANUP_MIN_WORD_RATIO:
+        problems.append(f"too much text removed (only {ratio:.0%} of the words kept)")
+    elif ratio > CLEANUP_MAX_WORD_RATIO:
+        problems.append(f"text was added ({ratio:.0%} of the input's words)")
+
+    vocab = set(src_words)
+    novel = [w for w in out_words if w not in vocab]
+    if len(novel) / len(out_words) > CLEANUP_MAX_NOVEL_RATIO:
+        problems.append(f"{len(novel)} output words ({len(novel) / len(out_words):.1%}) do not occur in the input, e.g. {sorted(set(novel))[:5]}")
+
+    markers = ("#", "```", "**")
+    if not any(l.lstrip().startswith(markers) for l in src.splitlines()):
+        if any(l.lstrip().startswith(markers) for l in out.splitlines()):
+            problems.append("output contains markdown headers/bold/code fences that are not in the input")
+    return problems
+
+
+def _render_cleanup_prompt(template: str, chunk_no: int, chunk_total: int, in_name: str, out_name: str) -> str:
+    """prompts/pass0-cleanup.md adapted to one chunk (see the note above)."""
+    body = template.replace("transcript-raw.txt", in_name).replace("transcript.txt", out_name)
+    header = (
+        f"NOTE FOR THIS CALL: the attached file `{in_name}` is ONE SECTION (part {chunk_no} of {chunk_total}) "
+        f"of a longer transcript, not the whole transcript. Clean only this section, keep it in order, and write "
+        f"the result to `{out_name}`. Wherever the rules below say \"the transcript\", read it as this section. "
+        f"The section may start or end mid-sentence: leave such edges exactly as they are.\n\n"
     )
-    _require(workdir / "transcript.txt", "Pass 0")
-    logger.info("  wrote %s", workdir / "transcript.txt")
+    return header + body
+
+
+def _load_cleanup_template() -> str:
+    path = PROMPTS_DIR / "pass0-cleanup.md"
+    if not path.exists():
+        raise StagePermanentError(f"{path} not found — pass 0 reads its rules from that file")
+    text = path.read_text()
+    if "transcript.txt" not in text:
+        logger.warning("  %s doesn't mention `transcript.txt`: the chunk's output file name is only given in the "
+                       "note prepended to the prompt", path.name)
+    return text
+
+
+def _cleanup_one_chunk(
+    label: str, chunk_no: int, chunk_total: int, src: str, in_path: Path, out_path: Path,
+    prompt_path: Path, log_path: Path, cwd: Path, model: str, template: str,
+) -> str | None:
+    """Run the LLM on one chunk until it returns output that passes validate_cleanup_chunk().
+    Returns the cleaned text, or None after CLEANUP_CHUNK_ATTEMPTS invalid/failed attempts.
+    A provider "retry in Ns" rejection is waited out and does NOT use up an attempt."""
+    prompt_path.write_text(_render_cleanup_prompt(template, chunk_no, chunk_total, in_path.name, out_path.name))
+    attempts = rate_limit_waits = 0
+    while attempts < CLEANUP_CHUNK_ATTEMPTS:
+        out_path.unlink(missing_ok=True)  # never let a stale file from an earlier attempt pass for this one
+        try:
+            run_opencode(
+                attachments=[in_path], prompt_file=prompt_path, model=model,
+                logfile=log_path, cwd=cwd, agent="notes-writer",
+            )
+        except OpencodeRateLimit as e:
+            rate_limit_waits += 1
+            if e.retry_after > RATE_LIMIT_MAX_WAIT_SECONDS or rate_limit_waits > RATE_LIMIT_MAX_WAITS:
+                raise StagePermanentError(
+                    f"{label}: provider quota exhausted (asked to wait {e.retry_after:.0f}s, "
+                    f"{rate_limit_waits} rate-limit waits so far) — retry later; finished chunks are kept in {cwd}"
+                ) from e
+            wait = e.retry_after + 2
+            logger.warning("  %s: rate limited — waiting %.0fs as requested by the provider", label, wait)
+            time.sleep(wait)
+            THROTTLE.reset()
+            continue
+        except (RuntimeError, TimeoutError) as e:
+            attempts += 1
+            logger.warning("  %s: attempt %d/%d failed (%s)", label, attempts, CLEANUP_CHUNK_ATTEMPTS, e)
+            continue
+
+        attempts += 1
+        if not out_path.exists():
+            logger.warning("  %s: attempt %d/%d — opencode finished but did not write %s", label, attempts, CLEANUP_CHUNK_ATTEMPTS, out_path.name)
+            continue
+        out = out_path.read_text()
+        problems = validate_cleanup_chunk(src, out)
+        if not problems:
+            return out
+        logger.warning("  %s: attempt %d/%d rejected — %s", label, attempts, CLEANUP_CHUNK_ATTEMPTS, "; ".join(problems))
+    return None
+
+
+def stage_cleanup(workdir: Path, model_cleanup: str | None = None) -> None:
+    """Pass 0: turn transcript-raw.txt into transcript.txt.
+
+    A. collapse_repeats(): exact Whisper loops removed in plain Python (free, deterministic).
+       Saved as transcript-deduped.txt so you can diff it against the raw file.
+    B. The result is split into ~CLEANUP_CHUNK_WORDS-word chunks; each chunk goes through
+       one small opencode call (agent "notes-writer": write-only, no tools to wander with)
+       that fixes filler repeats and obvious typos.
+    C. Every chunk's output is VALIDATED (non-empty, word count within bounds, no
+       invented vocabulary/markdown). A chunk that doesn't validate is retried; if it
+       still doesn't, that chunk keeps its de-looped, un-cleaned text. Under-cleaning is
+       acceptable, losing content is not.
+
+    Why chunks: the whole-file approach re-sent a ~15K-token transcript on every agent step
+    and needed the model to emit all of it in one answer, which is what hit the quota.
+    Per-chunk calls are small, predictable, paced by TokenThrottle, and resumable: chunk
+    files live in workdir/cleanup/, and a chunk whose input is unchanged and whose output
+    still validates is reused on re-runs (delete that folder to force a full redo).
+    """
+    model = model_cleanup or CLEANUP_MODEL
+    logger.info("[2/7] Pass 0: transcript cleanup (de-loop in Python + chunked LLM pass, model=%s)", model)
+
+    raw_path = workdir / "transcript-raw.txt"
+    final_path = workdir / "transcript.txt"
+    final_path.unlink(missing_ok=True)  # a stale transcript from an earlier run must not satisfy _require()
+
+    raw = raw_path.read_text()
+    raw_words = len(raw.split())
+
+    deduped, removed = collapse_repeats(raw)
+    (workdir / "transcript-deduped.txt").write_text(deduped)
+    logger.info("  step A (no LLM): removed %d words of exact repeats/loops (%d -> %d words)", removed, raw_words, raw_words - removed)
+
+    chunks = _split_into_chunks(deduped.split("\n"), CLEANUP_CHUNK_WORDS)
+    chunk_dir = workdir / "cleanup"
+    chunk_dir.mkdir(exist_ok=True)
+    template = _load_cleanup_template()
+    logger.info("  step B: %d chunk(s) of up to ~%d words", len(chunks), CLEANUP_CHUNK_WORDS)
+
+    pieces: list[str] = []
+    fallbacks: list[int] = []
+    reused = unchanged = 0
+    for idx, chunk_lines in enumerate(chunks):
+        label = f"chunk {idx + 1}/{len(chunks)}"
+        stem = f"chunk_{idx:03d}"
+        in_path, out_path = chunk_dir / f"{stem}.in.txt", chunk_dir / f"{stem}.out.txt"
+        src = "\n".join(chunk_lines) + "\n"
+
+        if in_path.exists() and out_path.exists() and in_path.read_text() == src:
+            cached = out_path.read_text()
+            if not validate_cleanup_chunk(src, cached):
+                logger.info("  %s: reusing validated output from an earlier run", label)
+                pieces.append(cached.rstrip("\n"))
+                reused += 1
+                continue
+
+        in_path.write_text(src)
+        logger.info("  %s: %d words", label, len(src.split()))
+        cleaned = _cleanup_one_chunk(
+            label, idx + 1, len(chunks), src, in_path, out_path, chunk_dir / f"{stem}.prompt.md", chunk_dir / f"{stem}.log",
+            chunk_dir, model, template,
+        )
+        if cleaned is None:
+            logger.warning("  %s: no valid LLM output after %d attempts — keeping its de-looped text unchanged (nothing dropped)", label, CLEANUP_CHUNK_ATTEMPTS)
+            fallbacks.append(idx + 1)
+            pieces.append(src.rstrip("\n"))
+            continue
+        if cleaned.strip() == src.strip():
+            unchanged += 1
+        pieces.append(cleaned.rstrip("\n"))
+
+    final_path.write_text("\n".join(pieces) + "\n")
+    final_words = len(final_path.read_text().split())
+    logger.info(
+        "  cleanup summary: raw %d -> de-looped %d -> final %d words | %d chunk(s): %d reused, %d returned unchanged, %d fell back to un-cleaned text",
+        raw_words, raw_words - removed, final_words, len(chunks), reused, unchanged, len(fallbacks),
+    )
+    if fallbacks:
+        logger.warning("  chunk(s) %s were NOT LLM-cleaned (see %s/chunk_NNN.log); re-run '--from-stage cleanup' to retry just those", fallbacks, chunk_dir)
+    if removed == 0 and len(fallbacks) + unchanged + reused == len(chunks):
+        logger.warning("  pass 0 changed nothing at all — fine if the transcript was already clean, but worth a glance at %s", chunk_dir)
+
+    _require(final_path, "Pass 0")
+    logger.info("  wrote %s", final_path)
 
 
 def stage_extract(workdir: Path, model_fast: str | None) -> None:
     logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
-    # opencode's default agent, same reasoning as stage_cleanup: transcript.txt is already
-    # fully inlined via --file, and this stage never opens any other file, so `read`
-    # would only ever be a redundant, possibly-truncated re-fetch.
+    # Agent "notes-writer": transcript.txt is already fully inlined via --file and this
+    # stage never opens any other file, so `read` and every other tool stay denied.
+    (workdir / "extract.md").unlink(missing_ok=True)  # a stale file must not satisfy _require()
     run_opencode(
         attachments=[workdir / "transcript.txt"], prompt_file=PROMPTS_DIR / "pass1-extract.md",
-        model=GEMINI_LATEST, logfile=workdir / "pass1.log", cwd=workdir,
+        model=GEMINI_LATEST, logfile=workdir / "pass1.log", cwd=workdir, agent="notes-writer",
     )
     _require(workdir / "extract.md", "Pass 1")
     logger.info("  wrote %s", workdir / "extract.md")
@@ -576,23 +1116,33 @@ def stage_enrich(workdir: Path, model_fast: str | None) -> None:
 
         items_block = "\n".join(f"- {item}" for item in batch)
         prompt_text = base_prompt.replace("{{ITEMS}}", items_block).replace("{{OUTPUT_FILE}}", batch_file.name)
-        prompt_file.write_text(prompt_text)
 
         label = batch[0] if batch_size == 1 else f"{len(batch)} items"
+
+        # Resume: if this exact batch (same prompt) already produced output — e.g. in a previous
+        # attempt of this stage that failed on a later batch — don't pay for it again.
+        if (batch_file.exists() and batch_file.read_text().strip()
+                and prompt_file.exists() and prompt_file.read_text() == prompt_text):
+            logger.info("  batch %d/%d: %s -> reusing %s from an earlier attempt", idx + 1, len(batches), label, batch_file.name)
+            batch_files.append(batch_file)
+            continue
+
+        prompt_file.write_text(prompt_text)
+        batch_file.unlink(missing_ok=True)  # a stale/empty file must not satisfy _require()
         logger.info("  batch %d/%d: %s -> %s", idx + 1, len(batches), label, batch_file.name)
 
         # cwd=enrich_dir (not workdir) so opencode's relative "write to {{OUTPUT_FILE}}"
         # lands batch_file.name inside enrich/, matching where batch_file actually is.
-        # opencode's default agent grants webfetch/websearch (needs the real web lookups)
-        # plus edit, unlike the write-only agents used elsewhere in this pipeline.
+        # Agent "notes-enrich": web fetch/search + edit, nothing else. Pacing against the
+        # provider's TPM limit is done inside run_opencode() (TokenThrottle).
         run_opencode(
             attachments=[], prompt_file=prompt_file, model=ENRICH_MODEL,
-            logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir,
+            logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir, agent="notes-enrich",
+            # pass2-enrich.md tries up to 4 sources per topic (it.wikipedia, wiktionary, arXiv,
+            # DuckDuckGo): leave room for that so the step cap never cuts a batch off before it
+            # writes its file (the default cap of 40 would be too tight for BATCH_SIZE=8).
+            max_steps=5 * len(batch) + 8, est_calls=2 * len(batch) + 3,
         )
-
-        if not is_local:  # local opencode calls don't hit a cloud TPM limit, so no need to wait
-            logger.info(" Sleeping 1 min... TPM limit ")
-            time.sleep(60)
 
         _require(batch_file, f"Pass 2 batch {idx + 1}/{len(batches)}")  # don't proceed until usable output exists
         batch_files.append(batch_file)
@@ -621,33 +1171,50 @@ def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> 
     # arguments" section is already a compressed-but-complete, sentence-by-sentence
     # record of the talk (see pass1-extract.md's no-ellipsis rule), so re-sending the
     # full transcript on top would just burn tokens for content opencode already has.
-    # opencode's default agent — both attachments are already fully inlined, and this stage
+    # Agent "notes-writer": both attachments are already fully inlined, and this stage
     # never needs to open any other file.
+    (workdir / "notes.md").unlink(missing_ok=True)  # a stale file must not satisfy _require()
     run_opencode(
         attachments=[workdir / "extract.md", workdir / "background.md"],
         prompt_file=PROMPTS_DIR / "pass3-synthesize.md", model=GEMINI_LATEST,
-        logfile=workdir / "pass3.log", cwd=workdir, substitutions={"{{DATA}}": date_str},
+        logfile=workdir / "pass3.log", cwd=workdir, agent="notes-writer", substitutions={"{{DATA}}": date_str},
     )
     _require(workdir / "notes.md", "Pass 3")
     logger.info("  wrote %s", workdir / "notes.md")
 
 
 def stage_verify(workdir: Path, model_strong: str | None) -> None:
-    logger.info("[6/7] Pass 4: verification (flags unsupported claims, deletes nothing)")
-    # extract.md (not transcript.txt) is the ground truth pass4-verify.md checks the
-    # speaker's-view sentences against, so it's attached here instead of the full
-    # transcript. The opencode's default agent grants `read` here (unlike the write-only
-    # agents above): this pass uses `edit` to annotate notes.md in place, which needs to
-    # read current file state to locate exact text to replace — not the same safe no-op
-    # that denying `read` is for a pass that only ever writes fresh output from inlined
-    # attachments.
+    logger.info("[6/7] Pass 4: verification (fixes doubtful sentences in place, deletes nothing)")
+    notes = workdir / "notes.md"
+    snapshot = workdir / "notes.pre-verify.md"
+    shutil.copy2(notes, snapshot)
+    words_before = len(snapshot.read_text().split())
+
+    # pass4-verify.md says "search the web if you need" and "rewrite notes.md in place", so the
+    # agent "notes-editor" gets read + edit + websearch/webfetch (nothing else). notes.md is
+    # deliberately NOT attached: the agent has to `read` it anyway (opencode refuses to edit an
+    # existing file it hasn't read), and attaching it too would put two copies of the whole
+    # document into the context of every one of its many steps.
     run_opencode(
-        attachments=[workdir / "notes.md"],
+        attachments=[], read_files=[notes],
         prompt_file=PROMPTS_DIR / "pass4-verify.md", model=GEMINI_LATEST_LOW,
-        logfile=workdir / "pass4.log", cwd=workdir,
+        logfile=workdir / "pass4.log", cwd=workdir, agent="notes-editor",
     )
-    _require(workdir / "notes.md", "Pass 4")
-    logger.info("  updated %s", workdir / "notes.md")
+    _require(notes, "Pass 4")
+
+    # The prompt's one critical rule is "do not delete content". Enforce it: if the edited
+    # file lost more than VERIFY_MAX_SHRINK of its words, keep the pre-verify version instead.
+    words_after = len(notes.read_text().split())
+    if words_after < words_before * (1 - VERIFY_MAX_SHRINK):
+        rejected = workdir / "notes.verify-rejected.md"
+        shutil.copy2(notes, rejected)
+        shutil.copy2(snapshot, notes)
+        logger.warning(
+            "  verify shrank notes.md from %d to %d words (> %d%% loss) — restored the pre-verify version; "
+            "the rejected edit is kept as %s", words_before, words_after, int(VERIFY_MAX_SHRINK * 100), rejected.name,
+        )
+    else:
+        logger.info("  updated %s (%d -> %d words)", notes, words_before, words_after)
 
 
 # --- PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required) ---------
@@ -1034,7 +1601,7 @@ def _require(path: Path, stage_name: str) -> None:
 
 
 STAGE_RETRY_ATTEMPTS = 3
-STAGE_RETRY_SLEEP_SECONDS = 60
+STAGE_RETRY_SLEEP_SECONDS = 15  # pause after an ordinary failure; provider rate limits use their own hinted delay
 
 
 class StagePermanentError(RuntimeError):
@@ -1069,11 +1636,17 @@ def _run_stage_with_retry(stage_name: str, func, *args, **kwargs):
         except (RuntimeError, TimeoutError) as e:
             last_exc = e
             if attempt < STAGE_RETRY_ATTEMPTS:
+                if isinstance(e, OpencodeRateLimit):
+                    # Wait exactly what the provider asked for (+2s margin) instead of a fixed guess.
+                    delay = min(e.retry_after + 2, RATE_LIMIT_MAX_WAIT_SECONDS)
+                else:
+                    delay = STAGE_RETRY_SLEEP_SECONDS
                 logger.warning(
-                    "  [%s] attempt %d/%d failed (%s) — sleeping %ds before retry",
-                    stage_name, attempt, STAGE_RETRY_ATTEMPTS, e, STAGE_RETRY_SLEEP_SECONDS,
+                    "  [%s] attempt %d/%d failed (%s) — sleeping %.0fs before retry",
+                    stage_name, attempt, STAGE_RETRY_ATTEMPTS, e, delay,
                 )
-                time.sleep(STAGE_RETRY_SLEEP_SECONDS)
+                time.sleep(delay)
+                THROTTLE.reset()
             else:
                 logger.error("  [%s] failed after %d attempts", stage_name, STAGE_RETRY_ATTEMPTS)
     raise last_exc
@@ -1099,21 +1672,13 @@ def _run_pipeline_stages(audio: Path, workdir: Path, run_name: str, args: argpar
     if start <= STAGES.index("transcribe"):
         _run_stage_with_retry("transcribe", stage_transcribe, audio, workdir, args.whisper_model)
     if start <= STAGES.index("cleanup"):
-        _run_stage_with_retry("cleanup", stage_cleanup, workdir, args.model_fast)
-        logger.info(" Sleeping 1 min... TPM limit ")
-        time.sleep(60)
+        _run_stage_with_retry("cleanup", stage_cleanup, workdir, args.model_cleanup)
     if start <= STAGES.index("extract"):
         _run_stage_with_retry("extract", stage_extract, workdir, args.model_fast)
-        logger.info(" Sleeping 30 secs... TPM limit ")
-        time.sleep(30)
     if start <= STAGES.index("enrich"):
         _run_stage_with_retry("enrich", stage_enrich, workdir, args.model_fast)
-        logger.info(" Sleeping 30 secs... TPM limit ")
-        time.sleep(30)
     if start <= STAGES.index("synthesize"):
         _run_stage_with_retry("synthesize", stage_synthesize, workdir, args.model_strong, derive_date_from_filename(audio))
-        logger.info(" Sleeping 1 min... TPM limit ")
-        time.sleep(60)
     if start <= STAGES.index("verify"):
         _run_stage_with_retry("verify", stage_verify, workdir, args.model_strong)
     if start <= STAGES.index("pdf"):
@@ -1149,8 +1714,13 @@ def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None
             "pipeline for %s from '%s' — one retry allowed before giving up.",
             e, audio.name, from_stage,
         )
+        restart_from = from_stage
+        raw_transcript = workdir / "transcript-raw.txt"
+        if from_stage == "transcribe" and raw_transcript.exists() and raw_transcript.read_text().strip():
+            restart_from = "cleanup"  # don't redo an hour of Whisper for a failure in a later stage
+            logger.info("  transcript-raw.txt already exists — restarting from 'cleanup' instead of re-transcribing")
         time.sleep(STAGE_RETRY_SLEEP_SECONDS)
-        _run_pipeline_stages(audio, workdir, run_name, args, from_stage)
+        _run_pipeline_stages(audio, workdir, run_name, args, restart_from)
 
     if not args.keep_input and from_stage == "transcribe":
         try:
@@ -1212,7 +1782,12 @@ def main() -> None:
     parser.add_argument(
         "--model-fast", default=os.environ.get("OPENCODE_MODEL_FAST"),
         help=f"Model for extract/enrich passes (env: OPENCODE_MODEL_FAST), as provider/model. Does NOT affect "
-             f"cleanup (pass 0), which is always forced to the local CLEANUP_MODEL ({GEMINI_LATEST}) regardless of this flag.",
+             f"cleanup (pass 0) — use --model-cleanup for that.",
+    )
+    parser.add_argument(
+        "--model-cleanup", default=None,
+        help=f"Model for the cleanup pass, as provider/model (env: OPENCODE_MODEL_CLEANUP; default: {CLEANUP_MODEL}). "
+             f"Use a local ollama/... model to keep that pass fully offline.",
     )
     parser.add_argument("--model-strong", default=os.environ.get("OPENCODE_MODEL_STRONG"), help="Model for synthesize/verify passes, as provider/model (env: OPENCODE_MODEL_STRONG)")
     parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT, help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
