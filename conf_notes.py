@@ -23,11 +23,11 @@ Only passes 0 (cleanup) and 1 (extract) ever see the transcript text itself — 
 work from extract.md/background.md/notes.md, which already contain everything they need,
 so the (much longer) transcript isn't re-sent to opencode on every later pass.
 
-Tool access per pass is controlled by one of three custom opencode agents (AGENT_PROFILES)
-that run_opencode() defines through OPENCODE_CONFIG_CONTENT and selects with `--agent` on
-every call. Every call's log is then audited for tools the agent should not have been able
-to use (shell, python, re-reading the attached file...) and a WARNING is printed if any
-show up, so a silently-ignored restriction can't go unnoticed again.
+Tool access per pass is controlled by one of three custom OpenCode agents (AGENT_PROFILES).
+run_opencode() writes native OpenCode v2 Markdown agent definitions under the call's
+working directory at `.opencode/agents/` and selects one with `--agent` on every call.
+Every call's log is audited for recognizable forbidden tool use and a WARNING is printed
+if any show up.
 
 Rate limits: input-token usage is estimated per call and spread over a sliding 60 s window
 (TokenThrottle, OPENCODE_TPM_BUDGET) instead of fixed sleeps; if the provider still
@@ -43,34 +43,12 @@ Requirements:
     pip install mlx-whisper weasyprint markdown
     brew install cairo pango gdk-pixbuf libffi ffmpeg   # WeasyPrint + mlx-whisper native deps
     opencode CLI already installed and authenticated (`opencode auth login`) for whichever
-    providers the `Models` defaults (section 1) resolve to. Run `opencode models` to confirm the exact
+    providers GEMINI_MODEL_1/2 below resolve to. Run `opencode models` to confirm the exact
     provider/model strings your account has — the ones baked in below are a starting guess.
 
 macOS note: if WeasyPrint fails to import with a library-loading error, Homebrew's libs
 usually just aren't on the dynamic linker's search path — see check_environment()'s error
 message for the exact fix (one `export`).
-
-Code layout (one file, organised so that every numbered section can later move into its
-own module without edits):
-   1. CONFIG     frozen dataclasses (Config & friends). Built once in main() and passed
-                 around explicitly; nothing is read from the environment at import time.
-   2. ERRORS
-   3. TEXT UTILS date-from-filename, extract.md parsing, long-line wrapping
-   4. LOGGING & FILES
-   5. OPENCODE   agent profiles, TokenThrottle, OpencodeRunner
-   6. TRANSCRIBE
-   7. CLEANUP    pass 0
-   8. PASSES     passes 1-4 (extract / enrich / synthesize / verify)
-   9. RENDER     CSS + HTML templates, PDF/HTML output
-  10. PIPELINE   RunContext, the STAGES registry, retries, per-file processing
-  11. CLI        environment check, argparse, main()
-
-Environment variables (all optional, read once by Config.from_env()):
-  OPENCODE_MODEL_FAST       model for extract + enrich      (--model-fast)
-  OPENCODE_MODEL_STRONG     model for synthesize + verify   (--model-strong)
-  OPENCODE_MODEL_CLEANUP    model for cleanup               (--model-cleanup)
-  OPENCODE_TIMEOUT_SECONDS, OPENCODE_TPM_BUDGET, CLEANUP_CHUNK_WORDS, OPENCODE_EXTRA_ARGS
-  CONF_NOTES_INPUT_DIR / _OUTPUT_DIR / _LOG_DIR / _WORK_DIR   relocate the folders
 
 Usage:
     python conf_notes.py                                            # scan INPUT_DIR
@@ -80,304 +58,116 @@ Usage:
 """
 
 from __future__ import annotations
-
-import argparse
-import functools
-import html
-import importlib
-import json
-import logging
-import os
-import re
-import select
-import shutil
-import signal
-import subprocess
-import sys
-import time
+import argparse, html, json, logging, os, re, select, shutil, signal, subprocess, sys, time
 from collections import Counter
-from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Mapping
 
-logger = logging.getLogger("conf_notes")
-
-
-# =========================================================================================
-# 1. CONFIG  (future: conf_notes/config.py)
-# =========================================================================================
-
+# --- Optional third-party imports, resolved once at startup ----------------------------
+# Kept optional so a missing backend degrades gracefully instead of crashing the script.
+# WeasyPrint can fail with OSError (not ImportError) when it can't dlopen its native libs
+# (pango/cairo/gdk-pixbuf) — see check_environment() for the macOS fix.
+#
+# Pin HF_HOME *before* mlx_whisper/huggingface_hub are imported: otherwise the cache
+# location depends on $HOME at call time, so running from cron/launchd/a different shell
+# can silently point at a different cache dir and make it look like the model is
+# re-downloaded every day.
 SCRIPT_DIR = Path(__file__).resolve().parent
+os.environ.setdefault("HF_HOME", str(SCRIPT_DIR / ".hf-cache"))
 
+try:
+    import mlx_whisper
+except ImportError:
+    mlx_whisper = None
 
-class ConfigError(ValueError):
-    """Invalid configuration (bad env var, out-of-range setting...)."""
+try:
+    import weasyprint
+except (ImportError, OSError) as _weasyprint_error:
+    weasyprint, WEASYPRINT_IMPORT_ERROR = None, str(_weasyprint_error)
+else:
+    WEASYPRINT_IMPORT_ERROR = None
 
+try:
+    import markdown
+except ImportError:
+    markdown = None
+# -----------------------------------------------------------------------------------------
 
-def _check(condition: bool, message: str) -> None:
-    if not condition:
-        raise ConfigError(message)
+PROMPTS_DIR = SCRIPT_DIR / "prompts"
+WORK_DIR = SCRIPT_DIR / "work"  # scratch space for intermediate files per run
 
+# Self-contained: these live next to the script and are created automatically if missing.
+# Override with absolute paths here to keep recordings/output elsewhere (iCloud, external disk).
+INPUT_DIR = SCRIPT_DIR / "input"
+OUTPUT_DIR = SCRIPT_DIR / "output"
+LOG_DIR = SCRIPT_DIR / "logs"
+
+STAGES = ["transcribe", "cleanup", "extract", "enrich", "synthesize", "verify", "pdf"]
+WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"}
 
 # opencode model IDs are always "provider/model" (run `opencode models` to see the exact
 # strings your authenticated providers expose). "google" below assumes you've run
 # `opencode auth login` for Gemini/Google AI Studio, and "ollama" assumes a local Ollama
 # server serving the tag after the slash — adjust both prefixes to match your setup.
-# NOTE: GEMINI_* are HOSTED Google models, not local ones — only LOCAL_MODEL (ollama/...)
-# runs on this machine.
+#
+# Pass 0 (cleanup) has its own model, CLEANUP_MODEL (defined below), independent of
+# --model-fast. NOTE: GEMINI_LATEST* are HOSTED Google models, not local ones — only
+# LOCAL_MODEL (ollama/...) runs on this machine. Override with --model-cleanup or the
+# OPENCODE_MODEL_CLEANUP env var.
 GEMINI_LATEST = "google/gemini-flash-lite-latest"
 GEMINI_LATEST_LOW = "google/gemini-flash-lite-latest#low"
 GEMINI_31_LOW = "google/gemini-3.1-flash-lite#low"
-LOCAL_MODEL = "ollama/gemma4:e4b-mlx"
+LOCAL_MODEL = "ollama/qwen3.5:4b-mlx" #"ollama/gemma4:e4b-mlx"
+LOCAL_MODEL_2 = "ollama/gemma4:e4b-mlx"
+OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"))
+# Pass 2 (enrich) model. Swap this to LOCAL_MODEL to run fully offline. stage_enrich()
+# reads this constant and adjusts itself automatically:
+#   - batch size drops to ENRICH_BATCH_SIZE_LOCAL (one item per opencode call) instead of
+#     BATCH_SIZE, since a local model's context window can't hold a cloud model's worth
+#     of web-search results for 80 items at once — that's what was overflowing before.
+#   - the per-call outputs go into workdir/enrich/ (one small .md per item/batch) instead
+#     of loose background_batch_N.md files, since there can now be many more of them.
+#   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
+ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
+BATCH_SIZE = 8             # items per opencode call when ENRICH_MODEL is a cloud model
+ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
 
-WHISPER_MODEL_DEFAULT = "mlx-community/whisper-large-v3-turbo"
-AUDIO_EXTENSIONS = frozenset({".m4a", ".mp3", ".wav", ".mp4", ".aac", ".flac", ".ogg", ".mov"})
+# --- Pass 0 (cleanup) and rate-limit settings -------------------------------------------
+CLEANUP_MODEL = os.environ.get("OPENCODE_MODEL_CLEANUP", GEMINI_LATEST_LOW)
+CLEANUP_CHUNK_WORDS = int(os.environ.get("CLEANUP_CHUNK_WORDS", "2000"))  # words per LLM call
+CLEANUP_CHUNK_ATTEMPTS = 3        # valid-output attempts per chunk before falling back to un-cleaned text
+CLEANUP_MIN_WORD_RATIO = 0.85     # accepted output must keep >= this share of the chunk's words ...
+CLEANUP_MAX_WORD_RATIO = 1.03     # ... and not grow by more than this
+CLEANUP_MAX_NOVEL_RATIO = 0.03    # max share of output words that don't occur in the input chunk
 
+RATE_LIMIT_MAX_WAITS = 6          # "retry in Ns" waits tolerated per chunk before giving up
+RATE_LIMIT_MAX_WAIT_SECONDS = 300 # a longer hint than this means a daily quota: waiting won't help
 
-def is_local_model(model: str | None) -> bool:
-    """Local (ollama/...) models have no cloud rate limit and a small context window."""
-    return (model or "").startswith("ollama/")
+# Input-token budget per rolling 60 s, used by TokenThrottle to pace calls to a hosted
+# model. Keep it below the provider's real limit (Google free tier: 250K/min) because the
+# per-call estimate is rough. 0 disables throttling. Local (ollama/...) models are never throttled.
+TPM_BUDGET = int(os.environ.get("OPENCODE_TPM_BUDGET", "200000"))
+CHARS_PER_TOKEN = 3.0             # rough figure for Italian text
+VERIFY_MAX_SHRINK = 0.10          # pass 4 may not shrink notes.md by more than this share of its words
+AGENT_BASE_TOKENS = 3000          # system prompt + tool definitions of the restricted agents
 
-
-@dataclass(frozen=True)
-class Paths:
-    """Every folder the script touches. `Paths.under(root)` gives the default layout
-    (everything next to the script); individual folders can be relocated afterwards
-    (iCloud Drive, external disk...) via replace() or the CONF_NOTES_*_DIR env vars."""
-    root: Path
-    prompts: Path
-    work: Path       # scratch space for intermediate files, one sub-folder per recording
-    input: Path
-    output: Path
-    logs: Path
-    hf_cache: Path   # Hugging Face cache (pinned so cron/launchd runs reuse the same models)
-
-    @classmethod
-    def under(cls, root: Path) -> "Paths":
-        return cls(
-            root=root, prompts=root / "prompts", work=root / "work", input=root / "input",
-            output=root / "output", logs=root / "logs", hf_cache=root / ".hf-cache",
-        )
-
-    def ensure(self) -> None:
-        """Create the folders that must exist before a run (input/ output/ logs/)."""
-        for path in (self.input, self.output, self.logs):
-            path.mkdir(parents=True, exist_ok=True)
-
-
-@dataclass(frozen=True)
-class Models:
-    """One model per stage, as "provider/model". The CLI/env "fast" and "strong" groups are
-    shortcuts that set several of these at once (see with_overrides())."""
-    whisper: str = WHISPER_MODEL_DEFAULT
-    cleanup: str = GEMINI_LATEST_LOW
-    extract: str = GEMINI_LATEST
-    # Swap enrich to LOCAL_MODEL to run pass 2 fully offline. stage_enrich() adapts by itself:
-    # batch size drops to EnrichSettings.batch_size_local (one item per call, since a local
-    # model's context can't hold 8 items' worth of web results), and the TPM throttle is
-    # skipped because it only exists for cloud rate limits.
-    enrich: str = GEMINI_31_LOW
-    synthesize: str = GEMINI_LATEST
-    verify: str = GEMINI_LATEST_LOW
-
-    def with_overrides(
-        self, *, fast: str | None = None, strong: str | None = None,
-        cleanup: str | None = None, whisper: str | None = None,
-    ) -> "Models":
-        """fast -> extract + enrich, strong -> synthesize + verify, cleanup -> cleanup.
-        Falsy values are ignored, so callers can pass argparse/env values straight in."""
-        updates: dict[str, str] = {}
-        if fast:
-            updates.update(extract=fast, enrich=fast)
-        if strong:
-            updates.update(synthesize=strong, verify=strong)
-        if cleanup:
-            updates["cleanup"] = cleanup
-        if whisper:
-            updates["whisper"] = whisper
-        return replace(self, **updates)
-
-
-@dataclass(frozen=True)
-class CleanupSettings:
-    """Pass 0 (see stage_cleanup())."""
-    chunk_words: int = 2000          # words per LLM call
-    chunk_attempts: int = 3          # valid-output attempts per chunk before falling back to un-cleaned text
-    min_word_ratio: float = 0.85     # accepted output must keep >= this share of the chunk's words ...
-    max_word_ratio: float = 1.03     # ... and not grow by more than this
-    max_novel_ratio: float = 0.03    # max share of output words that don't occur in the input chunk
-
-    def __post_init__(self) -> None:
-        _check(self.chunk_words >= 1, "cleanup.chunk_words must be >= 1")
-        _check(self.chunk_attempts >= 1, "cleanup.chunk_attempts must be >= 1")
-        _check(0 < self.min_word_ratio <= 1 <= self.max_word_ratio, "cleanup word ratios must satisfy 0 < min <= 1 <= max")
-
-
-@dataclass(frozen=True)
-class EnrichSettings:
-    """Pass 2 batching."""
-    batch_size: int = 8          # items per opencode call when the enrich model is a cloud model
-    batch_size_local: int = 1    # items per opencode call when it is a local (ollama/...) model
-
-    def __post_init__(self) -> None:
-        _check(self.batch_size >= 1 and self.batch_size_local >= 1, "enrich batch sizes must be >= 1")
-
-
-@dataclass(frozen=True)
-class RateLimitSettings:
-    max_waits: int = 6              # "retry in Ns" waits tolerated per chunk before giving up
-    max_wait_seconds: int = 300     # a longer hint than this means a daily quota: waiting won't help
-    # Input-token budget per rolling 60 s, used by TokenThrottle to pace calls to a hosted
-    # model. Keep it below the provider's real limit (Google free tier: 250K/min) because the
-    # per-call estimate is rough. 0 disables throttling. Local models are never throttled.
-    tpm_budget: int = 200_000
-    chars_per_token: float = 3.0    # rough figure for Italian text
-    agent_base_tokens: int = 3000   # system prompt + tool definitions of the restricted agents
-
-    def __post_init__(self) -> None:
-        _check(self.tpm_budget >= 0, "rate.tpm_budget must be >= 0")
-        _check(self.chars_per_token > 0, "rate.chars_per_token must be > 0")
-
-
-@dataclass(frozen=True)
-class RetrySettings:
-    stage_attempts: int = 3
-    stage_sleep_seconds: int = 15   # pause after an ordinary failure; provider rate limits use their own hinted delay
-
-    def __post_init__(self) -> None:
-        _check(self.stage_attempts >= 1, "retry.stage_attempts must be >= 1")
-
-
-@dataclass(frozen=True)
-class RenderSettings:
-    margin: str = "2cm"
-    font_size: str = "12pt"              # notes.pdf
-    transcript_font_size: str = "10pt"   # transcript.pdf — smaller since it's raw reference text, not the primary read
-    font_family: str = "Georgia, 'Times New Roman', serif"
-
-
-@dataclass(frozen=True)
-class Config:
-    """Everything tunable, in one immutable object. Build it once (Config.from_env(), then
-    .with_overrides() for CLI flags) and pass it down; no function reads module constants
-    or os.environ for settings."""
-    paths: Paths
-    models: Models = field(default_factory=Models)
-    cleanup: CleanupSettings = field(default_factory=CleanupSettings)
-    enrich: EnrichSettings = field(default_factory=EnrichSettings)
-    rate: RateLimitSettings = field(default_factory=RateLimitSettings)
-    retry: RetrySettings = field(default_factory=RetrySettings)
-    render: RenderSettings = field(default_factory=RenderSettings)
-    opencode_timeout_seconds: int = 1800
-    verify_max_shrink: float = 0.10      # pass 4 may not shrink notes.md by more than this share of its words
-    audio_extensions: frozenset[str] = AUDIO_EXTENSIONS
-    keep_input: bool = False
-    verbose: bool = False
-
-    def __post_init__(self) -> None:
-        _check(self.opencode_timeout_seconds > 0, "opencode_timeout_seconds must be > 0")
-        _check(0 <= self.verify_max_shrink < 1, "verify_max_shrink must be in [0, 1)")
-
-    @classmethod
-    def from_env(cls, root: Path | None = None, env: Mapping[str, str] | None = None) -> "Config":
-        """Defaults + environment variables. `env` is injectable for tests."""
-        env = os.environ if env is None else env
-
-        def env_int(name: str, default: int) -> int:
-            raw = env.get(name)
-            if raw is None or raw == "":
-                return default
-            try:
-                return int(raw)
-            except ValueError:
-                raise ConfigError(f"{name} must be an integer, got {raw!r}") from None
-
-        paths = Paths.under(Path(root) if root else SCRIPT_DIR)
-        folder_vars = {
-            "input": "CONF_NOTES_INPUT_DIR", "output": "CONF_NOTES_OUTPUT_DIR",
-            "logs": "CONF_NOTES_LOG_DIR", "work": "CONF_NOTES_WORK_DIR",
-        }
-        moved = {attr: Path(env[var]).expanduser() for attr, var in folder_vars.items() if env.get(var)}
-        paths = replace(paths, **moved)
-
-        models = Models().with_overrides(
-            fast=env.get("OPENCODE_MODEL_FAST"), strong=env.get("OPENCODE_MODEL_STRONG"),
-            cleanup=env.get("OPENCODE_MODEL_CLEANUP"),
-        )
-        return cls(
-            paths=paths,
-            models=models,
-            cleanup=CleanupSettings(chunk_words=env_int("CLEANUP_CHUNK_WORDS", CleanupSettings.chunk_words)),
-            rate=RateLimitSettings(tpm_budget=env_int("OPENCODE_TPM_BUDGET", RateLimitSettings.tpm_budget)),
-            opencode_timeout_seconds=env_int("OPENCODE_TIMEOUT_SECONDS", cls.opencode_timeout_seconds),
-        )
-
-    def with_overrides(
-        self, *, model_fast: str | None = None, model_strong: str | None = None,
-        model_cleanup: str | None = None, whisper_model: str | None = None,
-        keep_input: bool | None = None, verbose: bool | None = None,
-    ) -> "Config":
-        """A copy with CLI flags applied on top (None = leave as is)."""
-        updates: dict = {"models": self.models.with_overrides(
-            fast=model_fast, strong=model_strong, cleanup=model_cleanup, whisper=whisper_model,
-        )}
-        if keep_input is not None:
-            updates["keep_input"] = keep_input
-        if verbose is not None:
-            updates["verbose"] = verbose
-        return replace(self, **updates)
-
-
-def configure_environment(cfg: Config) -> None:
-    """Process-wide side effects, done explicitly from main() instead of at import time.
-
-    Pin HF_HOME *before* mlx_whisper/huggingface_hub are imported: otherwise the cache
-    location depends on $HOME at call time, so running from cron/launchd/a different shell
-    can silently point at a different cache dir and make it look like the model is
-    re-downloaded every day. (mlx_whisper is imported lazily, see _try_import().)"""
-    os.environ.setdefault("HF_HOME", str(cfg.paths.hf_cache))
-
-
-@functools.lru_cache(maxsize=None)
-def _try_import(name: str):
-    """(module, None) or (None, error text). Optional backends are imported lazily and once,
-    so a missing backend degrades gracefully instead of crashing the script at import.
-    WeasyPrint can fail with OSError (not ImportError) when it can't dlopen its native
-    libs (pango/cairo/gdk-pixbuf) — see check_environment() for the macOS fix."""
-    try:
-        return importlib.import_module(name), None
-    except (ImportError, OSError) as e:
-        return None, str(e)
-
-
-# =========================================================================================
-# 2. ERRORS  (future: conf_notes/errors.py)
-# =========================================================================================
-
-class OpencodeRateLimit(RuntimeError):
-    """opencode exited non-zero because the provider rejected the call for quota / rate-limit
-    reasons. `retry_after` is the delay in seconds the provider asked for, parsed from its
-    error message (60 when the message named none)."""
-
-    def __init__(self, message: str, retry_after: float):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-
-class StagePermanentError(RuntimeError):
-    """A stage failure that re-running the same stage against the same on-disk inputs
-    can never fix (e.g. a required upstream file has content the parser can't use).
-    Distinct from a plain RuntimeError, which may be a flaky opencode call/timeout
-    worth retrying. Raise this instead of RuntimeError for that kind of failure so
-    _run_stage_with_retry() fails fast instead of burning 3 retries x 60s on an error
-    that will reproduce identically every time."""
-
-
-# =========================================================================================
-# 3. TEXT UTILS  (future: conf_notes/textutils.py)
-# =========================================================================================
+# Files each stage needs already present when resuming with --from-stage (irrelevant for
+# a normal full run, where the prior stage just wrote them).
+#
+# Only "cleanup" and "extract" need the (raw/cleaned) transcript text. From "synthesize"
+# onward, extract.md's "Speaker's claims & arguments" section is already a
+# compressed-but-complete sentence-by-sentence record of the talk, so the full transcript
+# isn't re-attached to later opencode calls (it's long, and re-sending it burns tokens for
+# no extra information opencode doesn't already have via extract.md).
+STAGE_REQUIRES = {
+    "cleanup": ["transcript-raw.txt"],
+    "extract": ["transcript.txt"],
+    "enrich": ["extract.md"],
+    "synthesize": ["extract.md", "background.md"],
+    "verify": ["notes.md"],
+    "pdf": ["notes.md", "transcript.txt"],
+}
 
 _ITALIAN_MONTHS = [
     "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
@@ -429,6 +219,112 @@ def _parse_extract_items(extract_path: Path) -> list[str]:
                     items.append(item)
     return items
 
+# --- OpenCode v2 agents ------------------------------------------------------------------
+# Each call gets native Markdown agent definitions in <cwd>/.opencode/agents/. OpenCode v2
+# reads these files from the project context; OPENCODE_CONFIG_CONTENT is not used here.
+# Keeping the profiles in Python preserves a single source of truth and lets individual
+# calls override their step cap without editing the user's global OpenCode configuration.
+#
+#   allow      the only permission actions this agent may use; everything else is denied.
+#   steps      cap on the agent's tool loop (OpenCode then forces a plain-text answer).
+#   est_calls  how many model requests one invocation is assumed to make (for TokenThrottle).
+#   growth     tokens each step adds to the context (web pages / tool output), for that estimate.
+ALL_TOOL_KEYS = (
+    "read", "edit", "glob", "grep", "list", "bash", "execute", "task", "skill",
+    "webfetch", "websearch", "codesearch", "question", "todowrite", "todoread", "lsp",
+)
+
+AGENT_PROFILES = {
+    "notes-writer": {
+        "description": "Writes one fresh output file from the attached input. No read, no shell, no web.",
+        "allow": {"edit"},
+        "steps": 40,
+        "est_calls": 20,
+        "growth": 0,
+        "system": (
+            "You are a text-processing assistant. The complete input is already attached to the message, so "
+            "never read, list, search or run anything. Follow the instructions in the message exactly: write "
+            "the requested output file with the file-writing tool, containing only the requested text, then "
+            "answer with one short line and stop. Do not put commentary, notes or headers of your own in the file."
+        ),
+    },
+    # Pass 4 (pass4-verify.md) tells the model to "search the web if you need" and to rewrite
+    # notes.md IN PLACE, so this agent needs web access plus read (editing an existing file
+    # may require it to be read first).
+    "notes-editor": {
+        "description": "Fact-checks and edits an existing file in place. Read, edit, web search/fetch only.",
+        "allow": {"read", "edit", "webfetch", "websearch"},
+        "steps": 40,
+        "est_calls": 20,
+        "growth": 2000,
+        "system": (
+            "You are a careful fact-checking editor. Start by reading the file you are asked to check. You may "
+            "search the web to check doubtful facts. Apply only the corrections the message asks for, in place, "
+            "and never remove content. Do not run commands or read any other local file."
+        ),
+    },
+    # Pass 2 (pass2-enrich.md): web lookups for a batch of topics, one output file.
+    # run_opencode(max_steps=, est_calls=) scale steps/est_calls with the batch size.
+    "notes-enrich": {
+        "description": "Looks up topics on the web and writes a short background note. Web + edit only.",
+        "allow": {"edit", "webfetch", "websearch"},
+        "steps": 40,
+        "est_calls": 20,
+        "growth": 2000,
+        "system": (
+            "You are a research assistant. Follow the instructions in the message: look up every listed topic "
+            "on the web, and write the result to the requested file. Do not run commands or read local files."
+        ),
+    },
+}
+
+
+def _v2_permission_action(action: str) -> str:
+    """Translate legacy profile labels to OpenCode v2 permission action names."""
+    return {"bash": "shell", "task": "subagent"}.get(action, action)
+
+
+def _agent_markdown(profile: dict, steps: int) -> str:
+    """Render an OpenCode v2 agent file (YAML frontmatter + system prompt body)."""
+    # Permission rules are ordered; the last matching rule wins. Deny everything first,
+    # then explicitly allow only this profile's required actions.
+    lines = [
+        "---",
+        f"description: {json.dumps(profile['description'], ensure_ascii=False)}",
+        "mode: primary",
+        f"steps: {steps}",
+        "permissions:",
+        '  - action: "*"',
+        '    resource: "*"',
+        "    effect: deny",
+    ]
+    for action in sorted({_v2_permission_action(a) for a in profile["allow"]}):
+        lines.extend([
+            f"  - action: {json.dumps(action)}",
+            '    resource: "*"',
+            "    effect: allow",
+        ])
+    lines.extend(["---", "", profile["system"], ""])
+    return "\n".join(lines)
+
+
+def write_opencode_agents(cwd: Path, steps_override: dict[str, int] | None = None) -> Path:
+    """Write native OpenCode v2 agents into cwd/.opencode/agents.
+
+    This is intentionally project-local and per-call: it doesn't mutate global OpenCode
+    configuration, and it avoids relying on OPENCODE_CONFIG_CONTENT.
+    """
+    agent_dir = cwd / ".opencode" / "agents"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    overrides = steps_override or {}
+    for name, profile in AGENT_PROFILES.items():
+        steps = int(overrides.get(name, profile["steps"]))
+        if steps < 1:
+            raise ValueError(f"agent steps must be positive, got {steps} for {name}")
+        (agent_dir / f"{name}.md").write_text(_agent_markdown(profile, steps), encoding="utf-8")
+    return agent_dir
+
+
 def derive_date_from_filename(audio: Path) -> str:
     """Best-effort 'Data' value for notes.md's header.
 
@@ -460,6 +356,32 @@ def derive_date_from_filename(audio: Path) -> str:
     except OSError:
         pass
     return "non determinata"
+
+
+logger = logging.getLogger("conf_notes")
+
+
+def setup_logging(logfile: Path, verbose: bool) -> None:
+    """Log to the console and to a dedicated file for this run."""
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(console)
+
+    file_handler = logging.FileHandler(logfile)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+    logger.addHandler(file_handler)
+
+
+def discover_audio_files(input_dir: Path) -> list[Path]:
+    if not input_dir.exists():
+        return []
+    files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS]
+    return sorted(files, key=lambda p: p.name)
 
 
 # Ported from pi's `read` tool, which silently truncated per line at roughly this many
@@ -511,137 +433,14 @@ def ensure_no_long_lines(path: Path, max_bytes: int = OPENCODE_READ_LINE_LIMIT_B
     logger.debug("  rewrapped long line(s) in %s to stay under the ~%dKB read-line safety margin", path.name, max_bytes // 1000)
 
 
-# =========================================================================================
-# 4. LOGGING & FILES  (future: conf_notes/logs.py)
-# =========================================================================================
+class OpencodeRateLimit(RuntimeError):
+    """opencode exited non-zero because the provider rejected the call for quota / rate-limit
+    reasons. `retry_after` is the delay in seconds the provider asked for, parsed from its
+    error message (60 when the message named none)."""
 
-def setup_logging(logfile: Path, verbose: bool) -> None:
-    """Log to the console and to a dedicated file for this run."""
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(console)
-
-    file_handler = logging.FileHandler(logfile)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
-    logger.addHandler(file_handler)
-
-
-
-def discover_audio_files(input_dir: Path, extensions: frozenset[str] | set[str] = AUDIO_EXTENSIONS) -> list[Path]:
-    if not input_dir.exists():
-        return []
-    files = [p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() in extensions]
-    return sorted(files, key=lambda p: p.name)
-
-
-# =========================================================================================
-# 5. OPENCODE  (future: conf_notes/opencode.py)
-# =========================================================================================
-
-# --- opencode agents --------------------------------------------------------------------
-# Every opencode call runs under one of these restricted agents: run_opencode() selects it
-# with `--agent <name>` and defines it through OPENCODE_CONFIG_CONTENT (see
-# opencode_config_content()). Without that, opencode uses its default `build` agent with
-# EVERY tool enabled, and a small model will happily use them (shell, python scripts, git,
-# re-reading a file that is already attached, skills, questions...), re-sending the whole
-# context on each extra step — that is what burned the token quota in the pass-0 logs.
-#
-#   allow      the only tools the agent may use; everything else is denied. opencode gates
-#              both `write` and `edit` behind the single "edit" permission.
-#   steps      cap on the agent's tool loop (opencode then forces a plain-text answer).
-#   est_calls  how many model requests one invocation is assumed to make (each re-sends the
-#              full context) — only used by TokenThrottle for its estimate.
-#   growth     tokens each step adds to the context (web pages / tool output), for that
-#              estimate; 0 for agents that never use the web.
-ALL_TOOL_KEYS = (
-    "read", "edit", "glob", "grep", "list", "bash", "execute", "task", "skill",
-    "webfetch", "websearch", "codesearch", "question", "todowrite", "todoread", "lsp",
-)
-
-AGENT_PROFILES = {
-    "notes-writer": {
-        "description": "Writes one fresh output file from the attached input. No read, no bash, no web.",
-        "allow": {"edit"},
-        "steps": 6,
-        "est_calls": 3,
-        "growth": 0,
-        "system": (
-            "You are a text-processing assistant. The complete input is already attached to the message, so "
-            "never read, list, search or run anything. Follow the instructions in the message exactly: write "
-            "the requested output file with the file-writing tool, containing only the requested text, then "
-            "answer with one short line and stop. Do not put commentary, notes or headers of your own in the file."
-        ),
-    },
-    # Pass 4 (pass4-verify.md) tells the model to "search the web if you need" and to rewrite
-    # notes.md IN PLACE, so this agent needs web access plus read (opencode's edit/write tools
-    # refuse to touch an existing file that wasn't read first).
-    "notes-editor": {
-        "description": "Fact-checks and edits an existing file in place. Read, edit, web search/fetch only.",
-        "allow": {"read", "edit", "webfetch", "websearch"},
-        "steps": 40,
-        "est_calls": 20,
-        "growth": 2000,
-        "system": (
-            "You are a careful fact-checking editor. Start by reading the file you are asked to check. You may "
-            "search the web to check doubtful facts. Apply only the corrections the message asks for, in place, "
-            "and never remove content. Do not run commands or read any other local file."
-        ),
-    },
-    # Pass 2 (pass2-enrich.md): web lookups for a batch of topics, one output file.
-    # run_opencode(max_steps=, est_calls=) scale "steps"/"est_calls" with the batch size.
-    "notes-enrich": {
-        "description": "Looks up topics on the web and writes a short background note. Web + edit only.",
-        "allow": {"edit", "webfetch", "websearch"},
-        "steps": 40,
-        "est_calls": 20,
-        "growth": 2000,
-        "system": (
-            "You are a research assistant. Follow the instructions in the message: look up every listed topic "
-            "on the web, and write the result to the requested file. Do not run commands or read local files."
-        ),
-    },
-}
-
-
-def _build_permission(allow: set[str]) -> dict[str, str]:
-    """Default-deny permission map for one agent: "*" first, then an explicit entry per
-    known tool (opencode applies the last matching rule, and the explicit denies also
-    cover opencode versions that ignore the "*" wildcard)."""
-    perm = {"*": "deny"}
-    for tool in ALL_TOOL_KEYS:
-        perm[tool] = "allow" if tool in allow else "deny"
-    return perm
-
-
-def opencode_config_content(steps_override: dict[str, int] | None = None) -> str:
-    """JSON for the OPENCODE_CONFIG_CONTENT env var: our agents, merged into any config
-    already supplied through that variable. steps_override = {agent: steps} replaces an
-    agent's step cap for this one call (enrich scales it with the batch size)."""
-    agents = {
-        name: {
-            "description": p["description"],
-            "mode": "primary",
-            "prompt": p["system"],
-            "permission": _build_permission(p["allow"]),
-            "steps": (steps_override or {}).get(name, p["steps"]),
-        }
-        for name, p in AGENT_PROFILES.items()
-    }
-    config: dict = {}
-    existing = os.environ.get("OPENCODE_CONFIG_CONTENT")
-    if existing:
-        try:
-            config = json.loads(existing)
-        except ValueError:
-            logger.warning("OPENCODE_CONFIG_CONTENT is set but is not valid JSON — ignoring it")
-    config.setdefault("agent", {}).update(agents)
-    return json.dumps(config)
-
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class TokenThrottle:
@@ -675,15 +474,17 @@ class TokenThrottle:
         self.events.clear()
 
 
+THROTTLE = TokenThrottle(TPM_BUDGET)
 
-def _estimate_tokens(files: list[Path], prompt_text: str, agent: str, est_calls: int | None, rate: RateLimitSettings) -> int:
+
+def _estimate_tokens(files: list[Path], prompt_text: str, agent: str, est_calls: int | None) -> int:
     """Rough input-token total for one invocation: every request re-sends the prompt plus
     the files in context, and web-capable agents also accumulate `growth` tokens of tool
     output per step (so cost grows with the square of the number of steps)."""
     profile = AGENT_PROFILES[agent]
     calls = est_calls or profile["est_calls"]
     chars = len(prompt_text) + sum(p.stat().st_size for p in files if p.exists())
-    per_call = chars / rate.chars_per_token + rate.agent_base_tokens
+    per_call = chars / CHARS_PER_TOKEN + AGENT_BASE_TOKENS
     return int(per_call * calls + profile["growth"] * calls * (calls - 1) / 2)
 
 
@@ -695,12 +496,17 @@ _LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ")
 _TOOL_LINE_PATTERNS = [
     (re.compile(r"^\$ "), "bash"),
     (re.compile(r"^⚙\s"), "execute"),
-    (re.compile(r"^[→✗✓←]\s*Skill\b"), "skill"),
-    (re.compile(r"^[→✗✓←]\s*Read\b"), "read"),
-    (re.compile(r"^[→✗✓←]\s*Glob\b"), "glob"),
-    (re.compile(r"^[→✗✓←]\s*Grep\b"), "grep"),
-    (re.compile(r"^[→✗✓←]\s*List\b"), "list"),
-    (re.compile(r"^[→✗✓←]?\s*Asked \d+ question"), "question"),
+    (re.compile(r"^[→✗✓←]\s*Skill\b", re.I), "skill"),
+    (re.compile(r"^[→✗✓←]\s*Read\b", re.I), "read"),
+    (re.compile(r"^[→✗✓←]\s*Edit\b|^[→✗✓←]\s*Write\b|^[→✗✓←]\s*Patch\b", re.I), "edit"),
+    (re.compile(r"^[→✗✓←]\s*Glob\b", re.I), "glob"),
+    (re.compile(r"^[→✗✓←]\s*Grep\b", re.I), "grep"),
+    (re.compile(r"^[→✗✓←]\s*List\b", re.I), "list"),
+    (re.compile(r"^[→✗✓←]\s*Shell\b", re.I), "bash"),
+    (re.compile(r"^[→✗✓←]\s*WebSearch\b", re.I), "websearch"),
+    (re.compile(r"^[→✗✓←]\s*WebFetch\b", re.I), "webfetch"),
+    (re.compile(r"^[→✗✓←]\s*(?:TodoWrite|TodoRead|LSP|Task)\b", re.I), "other"),
+    (re.compile(r"^[→✗✓←]?\s*Asked \d+ question", re.I), "question"),
 ]
 
 
@@ -714,14 +520,13 @@ def _audit_log(agent: str, log_text: str) -> Counter:
         line = _LOG_TS_RE.sub("", _ANSI_RE.sub("", raw)).strip()
         for pattern, key in _TOOL_LINE_PATTERNS:
             if pattern.match(line):
-                if key not in allowed:
+                if key == "other" or key not in allowed:
                     used[key] += 1
                 break
     if used:
         logger.warning(
             "  agent '%s' used tools it should not have: %s — the permission restrictions were NOT "
-            "enforced. Check the opencode version's agent/permission config schema (see "
-            "opencode_config_content()) and the call log.",
+            "enforced. Check the OpenCode v2 agent/permission configuration and the call log.",
             agent, ", ".join(f"{k}×{v}" for k, v in used.items()),
         )
     return used
@@ -747,181 +552,169 @@ def _rate_limit_from_log(log_text: str) -> float | None:
     return 60.0
 
 
+def run_opencode(
+    *, attachments: list[Path], prompt_file: Path, model: str | None,
+    logfile: Path, cwd: Path, agent: str, substitutions: dict[str, str] | None = None,
+    max_steps: int | None = None, est_calls: int | None = None, read_files: list[Path] | None = None,
+) -> None:
+    """Invoke opencode non-interactively under one of the restricted AGENT_PROFILES:
+    opencode run --agent <agent> --file f1 --file f2 --model <provider/model> --auto "<prompt>"
 
-class OpencodeRunner:
-    """Runs opencode calls for one Config. Owns the TokenThrottle, so the rate-limit window
-    is shared by every call made through this runner (and by nothing else)."""
+    `agent` is mandatory on purpose: a call that forgets it would silently get opencode's
+    default all-tools agent again. Before launching, the call is paced by TokenThrottle
+    (hosted models only). After it, the log is audited for forbidden tool use, and a
+    quota / rate-limit failure is raised as OpencodeRateLimit carrying the provider's
+    "retry in Ns" delay so callers can wait exactly that long.
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.throttle = TokenThrottle(cfg.rate.tpm_budget)
+    We set the subprocess cwd explicitly to `workdir` (opencode resolves relative file
+    operations like "write to extract.md" against its own process cwd), and pass --auto
+    so a headless run never blocks waiting for an interactive permission prompt. Keep a
+    flag between the last --file and the prompt (here: --auto): --file takes several
+    values and could otherwise swallow the prompt.
 
-    def run(
-        self, *, attachments: list[Path], prompt_file: Path, model: str | None,
-        logfile: Path, cwd: Path, agent: str, substitutions: dict[str, str] | None = None,
-        max_steps: int | None = None, est_calls: int | None = None, read_files: list[Path] | None = None,
-    ) -> None:
-        """Invoke opencode non-interactively under one of the restricted AGENT_PROFILES:
-        opencode run --agent <agent> --file f1 --file f2 --model <provider/model> --thinking --auto "<prompt>"
+    Optional per-call tuning: max_steps overrides the agent's step cap, est_calls its assumed
+    number of requests, and read_files lists files the agent will `read` itself (not attached)
+    so the throttle's token estimate still counts them.
+    """
+    if agent not in AGENT_PROFILES:
+        raise ValueError(f"unknown opencode agent {agent!r}; expected one of {sorted(AGENT_PROFILES)}")
 
-        `agent` is mandatory on purpose: a call that forgets it would silently get opencode's
-        default all-tools agent again. Before launching, the call is paced by TokenThrottle
-        (hosted models only). After it, the log is audited for forbidden tool use, and a
-        quota / rate-limit failure is raised as OpencodeRateLimit carrying the provider's
-        "retry in Ns" delay so callers can wait exactly that long.
+    prompt_text = prompt_file.read_text()
+    # Fill in values the script already knows (e.g. the talk's date, derived from the
+    # filename) instead of leaving opencode to infer them from the transcript, which is
+    # unreliable for things speakers rarely state out loud.
+    for key, value in (substitutions or {}).items():
+        prompt_text = prompt_text.replace(key, value)
 
-        We set the subprocess cwd explicitly to `workdir` (opencode resolves relative file
-        operations like "write to extract.md" against its own process cwd), and pass --auto
-        so a headless run never blocks waiting for an interactive permission prompt. Keep a
-        flag between the last --file and the prompt (here: --auto): --file takes several
-        values and could otherwise swallow the prompt.
+    # OpenCode run in the installed CLI has no --dir flag. Set cwd and PWD to the
+    # call directory so relative file operations and the local .opencode agent files
+    # are resolved from the intended workspace.
+    cmd = ["opencode", "run", "--agent", agent]
+    for p in attachments:
+        cmd += ["--file", str(p)]
+    if model:
+        cmd += ["--model", model]
+    # Extra flags for OpenCode itself (e.g. --log-level debug). Keep opt-in because
+    # supported flags vary by CLI version: export OPENCODE_EXTRA_ARGS="--log-level debug"
+    cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
+    cmd += ["--auto", prompt_text]
 
-        Optional per-call tuning: max_steps overrides the agent's step cap, est_calls its assumed
-        number of requests, and read_files lists files the agent will `read` itself (not attached)
-        so the throttle's token estimate still counts them.
-        """
-        if agent not in AGENT_PROFILES:
-            raise ValueError(f"unknown opencode agent {agent!r}; expected one of {sorted(AGENT_PROFILES)}")
+    env = os.environ.copy()
+    # Enable opencode's web search integration for the enrichment pass.
+    env.setdefault("OPENCODE_ENABLE_EXA", "1")
+    # OpenCode v2 discovers Markdown agents from .opencode/agents/. Write them before
+    # launching and override only the selected agent's step cap for this call.
+    write_opencode_agents(cwd, {agent: max_steps} if max_steps else None)
+    # Do not rely on this legacy inline-config variable; it is not the v2 agent-loading
+    # mechanism. Remove an inherited value so behavior is deterministic.
+    env.pop("OPENCODE_CONFIG_CONTENT", None)
+    # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both aligned.
+    env["PWD"] = str(cwd.resolve())
 
-        prompt_text = prompt_file.read_text()
-        # Fill in values the script already knows (e.g. the talk's date, derived from the
-        # filename) instead of leaving opencode to infer them from the transcript, which is
-        # unreliable for things speakers rarely state out loud.
-        for key, value in (substitutions or {}).items():
-            prompt_text = prompt_text.replace(key, value)
+    if not (model or "").startswith("ollama/"):  # local models have no cloud TPM limit
+        estimate = _estimate_tokens(attachments + (read_files or []), prompt_text, agent, est_calls)
+        if 0 < THROTTLE.budget < estimate:
+            logger.warning(
+                "  this call alone is estimated at ~%dK input tokens, above the %dK/min budget — "
+                "expect a full-minute wait before it, and a provider rate limit if the real limit is as low. "
+                "Consider a smaller batch (BATCH_SIZE) or a higher-quota model.",
+                estimate // 1000, THROTTLE.budget // 1000,
+            )
+        THROTTLE.wait_for(estimate)
 
-        # OpenCode run does not support a --dir flag in the installed CLI version.
-        # Run the process with cwd=WORK_DIR and align PWD so OpenCode resolves its
-        # project root and all relative paths from the intended working directory.
-        cmd = ["opencode", "run", "--agent", agent]
-        for p in attachments:
-            cmd += ["--file", str(p)]
-        if model:
-            cmd += ["--model", model]
-        cmd += ["--thinking"]
-        # Extra flags for opencode itself (e.g. --log-level DEBUG). Varies by opencode
-        # version/config, so it's an opt-in env var: export OPENCODE_EXTRA_ARGS="--log-level DEBUG"
-        cmd += os.environ.get("OPENCODE_EXTRA_ARGS", "").split()
-        cmd += ["--auto", prompt_text]
+    logger.info(
+        "Running opencode (cwd=%s): opencode run --agent %s %s ...%s",
+        cwd, agent, " ".join(f"--file {p.name}" for p in attachments), f" --model {model}" if model else "",
+    )
 
-        env = os.environ.copy()
-        # Enable opencode's web search integration for the enrichment pass.
-        env.setdefault("OPENCODE_ENABLE_EXA", "1")
-        # Define our restricted agents for this call (merged into any config already in the env).
-        env["OPENCODE_CONFIG_CONTENT"] = opencode_config_content({agent: max_steps} if max_steps else None)
-        # OpenCode resolves its root from PWD in addition to process.cwd(). Keep both
-        # aligned so all relative writes land in the requested WORK_DIR/run directory.
-        env["PWD"] = str(cwd.resolve())
+    # Stream instead of subprocess.run(): piping stdout straight into logfile with a raw
+    # open() bypasses the logging module (no timestamps), and opencode's real-time
+    # activity (tool calls, retries, which provider actually answered) stays invisible
+    # until the whole call finishes. Streaming line-by-line lets us timestamp every row
+    # and mirror it into the main run log so it's visible live with -v.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env, text=False, bufsize=0,
+        # Close stdin immediately rather than passing DEVNULL: several non-interactive
+        # CLI agents (pi's -p mode being the original case that prompted this) sit in
+        # epoll_wait forever if stdin is /dev/null but exit cleanly once stdin is a pipe
+        # that's been closed. Cheap and harmless to keep for opencode too; drop it if you
+        # confirm opencode's `run` doesn't need it.
+        stdin=subprocess.PIPE,
+        start_new_session=True,  # own process group, so we can clean up stragglers below
+    )
+    proc.stdin.close()
 
-        if not is_local_model(model):  # local models have no cloud TPM limit
-            estimate = _estimate_tokens(attachments + (read_files or []), prompt_text, agent, est_calls, self.cfg.rate)
-            if 0 < self.throttle.budget < estimate:
-                logger.warning(
-                    "  this call alone is estimated at ~%dK input tokens, above the %dK/min budget — "
-                    "expect a full-minute wait before it, and a provider rate limit if the real limit is as low. "
-                    "Consider a smaller batch (enrich.batch_size) or a higher-quota model.",
-                    estimate // 1000, self.throttle.budget // 1000,
-                )
-            self.throttle.wait_for(estimate)
+    # Read with a poll/timeout loop instead of `for line in proc.stdout`, which blocks
+    # until EOF — requiring every process holding the write end open to close it, not
+    # just opencode. A tool opencode invokes (e.g. webfetch rendering a page) could in
+    # principle spawn a subprocess that inherits this pipe's fd and never closes it, so
+    # opencode finishes and exits cleanly but the pipe never sees EOF because a
+    # grandchild still holds it open. Polling treats "opencode's own process has exited"
+    # as the real completion signal, independent of anything else holding the pipe.
+    buf = b""
+    with open(logfile, "w") as lf:
+        started = time.monotonic()
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if chunk:
+                    buf += chunk
+                    while b"\n" in buf:
+                        raw, buf = buf.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace")
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        lf.write(f"{ts} {line}\n")
+                        lf.flush()
+                        logger.debug("[opencode] %s", line)
+                    continue  # more may be buffered; keep draining first
+            # No data ready. If opencode's own process already exited, we're done —
+            # anything still holding the pipe open is a leftover grandchild, not opencode.
+            if proc.poll() is not None:
+                break
 
-        logger.info(
-            "Running opencode (cwd=%s): opencode run --agent %s %s ...%s",
-            cwd, agent, " ".join(f"--file {p.name}" for p in attachments), f" --model {model}" if model else "",
-        )
-
-        # Stream instead of subprocess.run(): piping stdout straight into logfile with a raw
-        # open() bypasses the logging module (no timestamps), and opencode's real-time
-        # activity (tool calls, retries, which provider actually answered) stays invisible
-        # until the whole call finishes. Streaming line-by-line lets us timestamp every row
-        # and mirror it into the main run log so it's visible live with -v.
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd, env=env, text=False, bufsize=0,
-            # Close stdin immediately rather than passing DEVNULL: several non-interactive
-            # CLI agents (pi's -p mode being the original case that prompted this) sit in
-            # epoll_wait forever if stdin is /dev/null but exit cleanly once stdin is a pipe
-            # that's been closed. Cheap and harmless to keep for opencode too; drop it if you
-            # confirm opencode's `run` doesn't need it.
-            stdin=subprocess.PIPE,
-            start_new_session=True,  # own process group, so we can clean up stragglers below
-        )
-        proc.stdin.close()
-
-        # Read with a poll/timeout loop instead of `for line in proc.stdout`, which blocks
-        # until EOF — requiring every process holding the write end open to close it, not
-        # just opencode. A tool opencode invokes (e.g. webfetch rendering a page) could in
-        # principle spawn a subprocess that inherits this pipe's fd and never closes it, so
-        # opencode finishes and exits cleanly but the pipe never sees EOF because a
-        # grandchild still holds it open. Polling treats "opencode's own process has exited"
-        # as the real completion signal, independent of anything else holding the pipe.
-        timeout = self.cfg.opencode_timeout_seconds
-        buf = b""
-        with open(logfile, "w") as lf:
-            started = time.monotonic()
-            while True:
-                ready, _, _ = select.select([proc.stdout], [], [], 0.5)
-                if ready:
-                    chunk = os.read(proc.stdout.fileno(), 65536)
-                    if chunk:
-                        buf += chunk
-                        while b"\n" in buf:
-                            raw, buf = buf.split(b"\n", 1)
-                            line = raw.decode("utf-8", errors="replace")
-                            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            lf.write(f"{ts} {line}\n")
-                            lf.flush()
-                            logger.debug("[opencode] %s", line)
-                        continue  # more may be buffered; keep draining first
-                # No data ready. If opencode's own process already exited, we're done —
-                # anything still holding the pipe open is a leftover grandchild, not opencode.
-                if proc.poll() is not None:
-                    break
-
-                elapsed = time.monotonic() - started
-                if elapsed >= timeout:
-                    logger.error("opencode timed out after %.0f seconds; aborting pipeline", elapsed)
+            elapsed = time.monotonic() - started
+            if elapsed >= OPENCODE_TIMEOUT_SECONDS:
+                logger.error("opencode timed out after %.0f seconds; aborting pipeline", elapsed)
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
-                    raise TimeoutError(f"opencode exceeded the hard timeout of {timeout}s")
-            if buf:
-                line = buf.decode("utf-8", errors="replace")
-                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                lf.write(f"{ts} {line}\n")
-                logger.debug("[opencode] %s", line)
+                raise TimeoutError(f"opencode exceeded the hard timeout of {OPENCODE_TIMEOUT_SECONDS}s")
+        if buf:
+            line = buf.decode("utf-8", errors="replace")
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lf.write(f"{ts} {line}\n")
+            logger.debug("[opencode] %s", line)
 
-        returncode = proc.returncode
+    returncode = proc.returncode
 
-        # Best-effort cleanup of leftover descendants (e.g. a headless fetch opencode's
-        # webfetch tool spawned) so they don't pile up over many batches.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+    # Best-effort cleanup of leftover descendants (e.g. a headless fetch opencode's
+    # webfetch tool spawned) so they don't pile up over many batches.
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
 
-        log_text = logfile.read_text(errors="replace")
-        _audit_log(agent, log_text)
+    log_text = logfile.read_text(errors="replace")
+    _audit_log(agent, log_text)
 
-        if returncode != 0:
-            retry_after = _rate_limit_from_log(log_text)
-            if retry_after is not None:
-                raise OpencodeRateLimit(
-                    f"opencode call hit a provider quota/rate limit (exit {returncode}, retry in ~{retry_after:.0f}s). "
-                    f"See {logfile} for details.", retry_after,
-                )
-            raise RuntimeError(f"opencode call failed (exit {returncode}). See {logfile} for details.")
+    if returncode != 0:
+        retry_after = _rate_limit_from_log(log_text)
+        if retry_after is not None:
+            raise OpencodeRateLimit(
+                f"opencode call hit a provider quota/rate limit (exit {returncode}, retry in ~{retry_after:.0f}s). "
+                f"See {logfile} for details.", retry_after,
+            )
+        raise RuntimeError(f"opencode call failed (exit {returncode}). See {logfile} for details.")
 
-
-# =========================================================================================
-# 6. TRANSCRIBE  (future: conf_notes/transcribe.py)
-# =========================================================================================
 
 def _whisper_model_is_cached(whisper_model: str) -> bool:
     """Best-effort check of whether whisper_model is already in the local HF cache,
@@ -935,9 +728,8 @@ def _whisper_model_is_cached(whisper_model: str) -> bool:
 
 
 def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
-    mlx_whisper, error = _try_import("mlx_whisper")
     if mlx_whisper is None:
-        raise StagePermanentError(f"mlx-whisper could not be imported ({error}). Run: pip install mlx-whisper")
+        raise StagePermanentError("mlx-whisper not installed. Run: pip install mlx-whisper")
 
     if _whisper_model_is_cached(whisper_model):
         logger.debug("  Whisper model %s found in cache (%s) — no download needed", whisper_model, os.environ.get("HF_HOME"))
@@ -960,20 +752,15 @@ def transcribe_with_local_whisper(audio: Path, whisper_model: str) -> str:
     return result["text"].strip()  # fallback if a whisper backend/version omits segments
 
 
+def stage_transcribe(audio: Path, workdir: Path, whisper_model: str) -> None:
+    logger.info("[1/7] Transcribing audio (local mlx-whisper, model=%s)", whisper_model)
+    text = transcribe_with_local_whisper(audio, whisper_model)
 
-def stage_transcribe(ctx: RunContext) -> None:
-    model = ctx.cfg.models.whisper
-    logger.info("  local mlx-whisper, model=%s", model)
-    text = transcribe_with_local_whisper(ctx.audio, model)
-    out = ctx.workdir / "transcript-raw.txt"
+    out = workdir / "transcript-raw.txt"
     out.write_text(text)
     ensure_no_long_lines(out)  # belt-and-suspenders alongside the segment-based split above
     logger.info("  wrote %s (%d words)", out, len(text.split()))
 
-
-# =========================================================================================
-# 7. CLEANUP (pass 0)  (future: conf_notes/cleanup.py)
-# =========================================================================================
 
 # --- Pass 0: cleanup ---------------------------------------------------------------------
 # The cleanup rules live in prompts/pass0-cleanup.md (single source of truth, edit them
@@ -1104,7 +891,7 @@ def _split_into_chunks(lines: list[str], target_words: int) -> list[list[str]]:
     return chunks
 
 
-def validate_cleanup_chunk(src: str, out: str, cfg: CleanupSettings) -> list[str]:
+def validate_cleanup_chunk(src: str, out: str) -> list[str]:
     """Reasons why `out` is not an acceptable cleaned version of `src` (empty list = OK)."""
     if not out.strip():
         return ["output is empty"]
@@ -1117,14 +904,14 @@ def validate_cleanup_chunk(src: str, out: str, cfg: CleanupSettings) -> list[str
         return ["output has no words"]
 
     ratio = len(out_words) / len(src_words)
-    if ratio < cfg.min_word_ratio:
+    if ratio < CLEANUP_MIN_WORD_RATIO:
         problems.append(f"too much text removed (only {ratio:.0%} of the words kept)")
-    elif ratio > cfg.max_word_ratio:
+    elif ratio > CLEANUP_MAX_WORD_RATIO:
         problems.append(f"text was added ({ratio:.0%} of the input's words)")
 
     vocab = set(src_words)
     novel = [w for w in out_words if w not in vocab]
-    if len(novel) / len(out_words) > cfg.max_novel_ratio:
+    if len(novel) / len(out_words) > CLEANUP_MAX_NOVEL_RATIO:
         problems.append(f"{len(novel)} output words ({len(novel) / len(out_words):.1%}) do not occur in the input, e.g. {sorted(set(novel))[:5]}")
 
     markers = ("#", "```", "**")
@@ -1146,8 +933,8 @@ def _render_cleanup_prompt(template: str, chunk_no: int, chunk_total: int, in_na
     return header + body
 
 
-def _load_cleanup_template(prompts_dir: Path) -> str:
-    path = prompts_dir / "pass0-cleanup.md"
+def _load_cleanup_template() -> str:
+    path = PROMPTS_DIR / "pass0-cleanup.md"
     if not path.exists():
         raise StagePermanentError(f"{path} not found — pass 0 reads its rules from that file")
     text = path.read_text()
@@ -1158,24 +945,24 @@ def _load_cleanup_template(prompts_dir: Path) -> str:
 
 
 def _cleanup_one_chunk(
-    ctx: RunContext, label: str, chunk_no: int, chunk_total: int, src: str, in_path: Path, out_path: Path,
+    label: str, chunk_no: int, chunk_total: int, src: str, in_path: Path, out_path: Path,
     prompt_path: Path, log_path: Path, cwd: Path, model: str, template: str,
 ) -> str | None:
     """Run the LLM on one chunk until it returns output that passes validate_cleanup_chunk().
-    Returns the cleaned text, or None after ctx.cfg.cleanup.chunk_attempts invalid/failed attempts.
+    Returns the cleaned text, or None after CLEANUP_CHUNK_ATTEMPTS invalid/failed attempts.
     A provider "retry in Ns" rejection is waited out and does NOT use up an attempt."""
     prompt_path.write_text(_render_cleanup_prompt(template, chunk_no, chunk_total, in_path.name, out_path.name))
     attempts = rate_limit_waits = 0
-    while attempts < ctx.cfg.cleanup.chunk_attempts:
+    while attempts < CLEANUP_CHUNK_ATTEMPTS:
         out_path.unlink(missing_ok=True)  # never let a stale file from an earlier attempt pass for this one
         try:
-            ctx.runner.run(
+            run_opencode(
                 attachments=[in_path], prompt_file=prompt_path, model=model,
                 logfile=log_path, cwd=cwd, agent="notes-writer",
             )
         except OpencodeRateLimit as e:
             rate_limit_waits += 1
-            if e.retry_after > ctx.cfg.rate.max_wait_seconds or rate_limit_waits > ctx.cfg.rate.max_waits:
+            if e.retry_after > RATE_LIMIT_MAX_WAIT_SECONDS or rate_limit_waits > RATE_LIMIT_MAX_WAITS:
                 raise StagePermanentError(
                     f"{label}: provider quota exhausted (asked to wait {e.retry_after:.0f}s, "
                     f"{rate_limit_waits} rate-limit waits so far) — retry later; finished chunks are kept in {cwd}"
@@ -1183,31 +970,31 @@ def _cleanup_one_chunk(
             wait = e.retry_after + 2
             logger.warning("  %s: rate limited — waiting %.0fs as requested by the provider", label, wait)
             time.sleep(wait)
-            ctx.runner.throttle.reset()
+            THROTTLE.reset()
             continue
         except (RuntimeError, TimeoutError) as e:
             attempts += 1
-            logger.warning("  %s: attempt %d/%d failed (%s)", label, attempts, ctx.cfg.cleanup.chunk_attempts, e)
+            logger.warning("  %s: attempt %d/%d failed (%s)", label, attempts, CLEANUP_CHUNK_ATTEMPTS, e)
             continue
 
         attempts += 1
         if not out_path.exists():
-            logger.warning("  %s: attempt %d/%d — opencode finished but did not write %s", label, attempts, ctx.cfg.cleanup.chunk_attempts, out_path.name)
+            logger.warning("  %s: attempt %d/%d — opencode finished but did not write %s", label, attempts, CLEANUP_CHUNK_ATTEMPTS, out_path.name)
             continue
         out = out_path.read_text()
-        problems = validate_cleanup_chunk(src, out, ctx.cfg.cleanup)
+        problems = validate_cleanup_chunk(src, out)
         if not problems:
             return out
-        logger.warning("  %s: attempt %d/%d rejected — %s", label, attempts, ctx.cfg.cleanup.chunk_attempts, "; ".join(problems))
+        logger.warning("  %s: attempt %d/%d rejected — %s", label, attempts, CLEANUP_CHUNK_ATTEMPTS, "; ".join(problems))
     return None
 
 
-def stage_cleanup(ctx: RunContext) -> None:
+def stage_cleanup(workdir: Path, model_cleanup: str | None = None) -> None:
     """Pass 0: turn transcript-raw.txt into transcript.txt.
 
     A. collapse_repeats(): exact Whisper loops removed in plain Python (free, deterministic).
        Saved as transcript-deduped.txt so you can diff it against the raw file.
-    B. The result is split into ~cfg.cleanup.chunk_words-word chunks; each chunk goes through
+    B. The result is split into ~CLEANUP_CHUNK_WORDS-word chunks; each chunk goes through
        one small opencode call (agent "notes-writer": write-only, no tools to wander with)
        that fixes filler repeats and obvious typos.
     C. Every chunk's output is VALIDATED (non-empty, word count within bounds, no
@@ -1221,9 +1008,8 @@ def stage_cleanup(ctx: RunContext) -> None:
     files live in workdir/cleanup/, and a chunk whose input is unchanged and whose output
     still validates is reused on re-runs (delete that folder to force a full redo).
     """
-    cfg, workdir = ctx.cfg, ctx.workdir
-    model = cfg.models.cleanup
-    logger.info("  model=%s", model)
+    model = model_cleanup or CLEANUP_MODEL
+    logger.info("[2/7] Pass 0: transcript cleanup (de-loop in Python + chunked LLM pass, model=%s)", model)
 
     raw_path = workdir / "transcript-raw.txt"
     final_path = workdir / "transcript.txt"
@@ -1236,11 +1022,11 @@ def stage_cleanup(ctx: RunContext) -> None:
     (workdir / "transcript-deduped.txt").write_text(deduped)
     logger.info("  step A (no LLM): removed %d words of exact repeats/loops (%d -> %d words)", removed, raw_words, raw_words - removed)
 
-    chunks = _split_into_chunks(deduped.split("\n"), cfg.cleanup.chunk_words)
+    chunks = _split_into_chunks(deduped.split("\n"), CLEANUP_CHUNK_WORDS)
     chunk_dir = workdir / "cleanup"
     chunk_dir.mkdir(exist_ok=True)
-    template = _load_cleanup_template(cfg.paths.prompts)
-    logger.info("  step B: %d chunk(s) of up to ~%d words", len(chunks), cfg.cleanup.chunk_words)
+    template = _load_cleanup_template()
+    logger.info("  step B: %d chunk(s) of up to ~%d words", len(chunks), CLEANUP_CHUNK_WORDS)
 
     pieces: list[str] = []
     fallbacks: list[int] = []
@@ -1253,7 +1039,7 @@ def stage_cleanup(ctx: RunContext) -> None:
 
         if in_path.exists() and out_path.exists() and in_path.read_text() == src:
             cached = out_path.read_text()
-            if not validate_cleanup_chunk(src, cached, cfg.cleanup):
+            if not validate_cleanup_chunk(src, cached):
                 logger.info("  %s: reusing validated output from an earlier run", label)
                 pieces.append(cached.rstrip("\n"))
                 reused += 1
@@ -1262,11 +1048,11 @@ def stage_cleanup(ctx: RunContext) -> None:
         in_path.write_text(src)
         logger.info("  %s: %d words", label, len(src.split()))
         cleaned = _cleanup_one_chunk(
-            ctx, label, idx + 1, len(chunks), src, in_path, out_path, chunk_dir / f"{stem}.prompt.md", chunk_dir / f"{stem}.log",
+            label, idx + 1, len(chunks), src, in_path, out_path, chunk_dir / f"{stem}.prompt.md", chunk_dir / f"{stem}.log",
             chunk_dir, model, template,
         )
         if cleaned is None:
-            logger.warning("  %s: no valid LLM output after %d attempts — keeping its de-looped text unchanged (nothing dropped)", label, cfg.cleanup.chunk_attempts)
+            logger.warning("  %s: no valid LLM output after %d attempts — keeping its de-looped text unchanged (nothing dropped)", label, CLEANUP_CHUNK_ATTEMPTS)
             fallbacks.append(idx + 1)
             pieces.append(src.rstrip("\n"))
             continue
@@ -1289,48 +1075,32 @@ def stage_cleanup(ctx: RunContext) -> None:
     logger.info("  wrote %s", final_path)
 
 
-# =========================================================================================
-# 8. PASSES 1-4  (future: conf_notes/passes.py)
-# =========================================================================================
-
-def _require(path: Path, stage_name: str) -> None:
-    if not path.exists() or not path.read_text().strip():
-        raise RuntimeError(f"{stage_name} did not produce {path.name} — check the matching pass log in {path.parent} before continuing.")
-    # Belt-and-suspenders: whatever opencode/the model wrote, make sure it doesn't
-    # contain a line opencode itself can't fully read back in a later stage (see
-    # ensure_no_long_lines() for why this can't be guaranteed by prompt instructions
-    # alone).
-    ensure_no_long_lines(path)
-
-
-def stage_extract(ctx: RunContext) -> None:
-    workdir = ctx.workdir
+def stage_extract(workdir: Path, model_fast: str | None) -> None:
+    logger.info("[3/7] Pass 1: extraction (transcript-only, no outside knowledge)")
     # Agent "notes-writer": transcript.txt is already fully inlined via --file and this
     # stage never opens any other file, so `read` and every other tool stay denied.
     (workdir / "extract.md").unlink(missing_ok=True)  # a stale file must not satisfy _require()
-    ctx.runner.run(
-        attachments=[workdir / "transcript.txt"], prompt_file=ctx.prompt("pass1-extract.md"),
-        model=ctx.cfg.models.extract, logfile=workdir / "pass1.log", cwd=workdir, agent="notes-writer",
+    run_opencode(
+        attachments=[workdir / "transcript.txt"], prompt_file=PROMPTS_DIR / "pass1-extract.md",
+        model=GEMINI_LATEST, logfile=workdir / "pass1.log", cwd=workdir, agent="notes-writer",
     )
     _require(workdir / "extract.md", "Pass 1")
     logger.info("  wrote %s", workdir / "extract.md")
 
 
-def stage_enrich(ctx: RunContext) -> None:
+def stage_enrich(workdir: Path, model_fast: str | None) -> None:
     """Pass 2: look up each extracted topic/entity and write a short background note
-    for it. Batch size adapts to the enrich model (see Models.enrich): a cloud model
-    gets enrich.batch_size items per opencode call, a local (ollama/...) model gets
-    enrich.batch_size_local (1), because each call's own web-search results otherwise
-    blow past a local context window.
+    for it. Batch size adapts to ENRICH_MODEL (see its comment above): a cloud model
+    gets BATCH_SIZE items per opencode call, a local model gets ENRICH_BATCH_SIZE_LOCAL
+    (1), each call's own web-search results otherwise blow past a local context window.
 
     Per-call outputs (one .md per batch, or per item when local) live in their own
     workdir/enrich/ subfolder so a many-batches local run doesn't clutter workdir with
     hundreds of loose files; they're merged into background.md at the end either way.
     """
-    cfg, workdir = ctx.cfg, ctx.workdir
-    model = cfg.models.enrich
-    batch_size = cfg.enrich.batch_size_local if is_local_model(model) else cfg.enrich.batch_size
-    logger.info("  batched enrichment (model=%s, batch_size=%d)", model, batch_size)
+    is_local = ENRICH_MODEL == LOCAL_MODEL
+    batch_size = ENRICH_BATCH_SIZE_LOCAL if is_local else BATCH_SIZE
+    logger.info("[4/7] Pass 2: multi-source enrichment (batched, model=%s, batch_size=%d)", ENRICH_MODEL, batch_size)
 
     extract_path = workdir / "extract.md"
     if not extract_path.exists():
@@ -1349,7 +1119,7 @@ def stage_enrich(ctx: RunContext) -> None:
     enrich_dir = workdir / "enrich"
     enrich_dir.mkdir(exist_ok=True)
 
-    base_prompt = ctx.prompt("pass2-enrich.md").read_text()
+    base_prompt = (PROMPTS_DIR / "pass2-enrich.md").read_text()
     batch_files = []
 
     for idx, batch in enumerate(batches):
@@ -1376,13 +1146,13 @@ def stage_enrich(ctx: RunContext) -> None:
         # cwd=enrich_dir (not workdir) so opencode's relative "write to {{OUTPUT_FILE}}"
         # lands batch_file.name inside enrich/, matching where batch_file actually is.
         # Agent "notes-enrich": web fetch/search + edit, nothing else. Pacing against the
-        # provider's TPM limit is done inside OpencodeRunner.run() (TokenThrottle).
-        ctx.runner.run(
-            attachments=[], prompt_file=prompt_file, model=model,
+        # provider's TPM limit is done inside run_opencode() (TokenThrottle).
+        run_opencode(
+            attachments=[], prompt_file=prompt_file, model=ENRICH_MODEL,
             logfile=enrich_dir / f"item_{idx:04d}.log", cwd=enrich_dir, agent="notes-enrich",
             # pass2-enrich.md tries up to 4 sources per topic (it.wikipedia, wiktionary, arXiv,
             # DuckDuckGo): leave room for that so the step cap never cuts a batch off before it
-            # writes its file (the default cap of 40 would be too tight for batch_size=8).
+            # writes its file (the default cap of 40 would be too tight for BATCH_SIZE=8).
             max_steps=5 * len(batch) + 8, est_calls=2 * len(batch) + 3,
         )
 
@@ -1406,9 +1176,8 @@ def stage_enrich(ctx: RunContext) -> None:
     _require(background_md, "Pass 2")
 
 
-def stage_synthesize(ctx: RunContext) -> None:
-    workdir = ctx.workdir
-    date_str = derive_date_from_filename(ctx.audio)
+def stage_synthesize(workdir: Path, model_strong: str | None, date_str: str) -> None:
+    logger.info("[5/7] Pass 3: synthesis into full academic notes (no info dropped)")
     logger.debug("  using date_str=%r for notes.md header (derived from filename/mtime, not asked of opencode)", date_str)
     # Deliberately NOT attaching transcript.txt: extract.md's "Speaker's claims &
     # arguments" section is already a compressed-but-complete, sentence-by-sentence
@@ -1417,17 +1186,17 @@ def stage_synthesize(ctx: RunContext) -> None:
     # Agent "notes-writer": both attachments are already fully inlined, and this stage
     # never needs to open any other file.
     (workdir / "notes.md").unlink(missing_ok=True)  # a stale file must not satisfy _require()
-    ctx.runner.run(
+    run_opencode(
         attachments=[workdir / "extract.md", workdir / "background.md"],
-        prompt_file=ctx.prompt("pass3-synthesize.md"), model=ctx.cfg.models.synthesize,
+        prompt_file=PROMPTS_DIR / "pass3-synthesize.md", model=GEMINI_LATEST,
         logfile=workdir / "pass3.log", cwd=workdir, agent="notes-writer", substitutions={"{{DATA}}": date_str},
     )
     _require(workdir / "notes.md", "Pass 3")
     logger.info("  wrote %s", workdir / "notes.md")
 
 
-def stage_verify(ctx: RunContext) -> None:
-    workdir, max_shrink = ctx.workdir, ctx.cfg.verify_max_shrink
+def stage_verify(workdir: Path, model_strong: str | None) -> None:
+    logger.info("[6/7] Pass 4: verification (fixes doubtful sentences in place, deletes nothing)")
     notes = workdir / "notes.md"
     snapshot = workdir / "notes.pre-verify.md"
     shutil.copy2(notes, snapshot)
@@ -1438,34 +1207,34 @@ def stage_verify(ctx: RunContext) -> None:
     # deliberately NOT attached: the agent has to `read` it anyway (opencode refuses to edit an
     # existing file it hasn't read), and attaching it too would put two copies of the whole
     # document into the context of every one of its many steps.
-    ctx.runner.run(
+    run_opencode(
         attachments=[], read_files=[notes],
-        prompt_file=ctx.prompt("pass4-verify.md"), model=ctx.cfg.models.verify,
+        prompt_file=PROMPTS_DIR / "pass4-verify.md", model=GEMINI_LATEST_LOW,
         logfile=workdir / "pass4.log", cwd=workdir, agent="notes-editor",
     )
     _require(notes, "Pass 4")
 
     # The prompt's one critical rule is "do not delete content". Enforce it: if the edited
-    # file lost more than verify_max_shrink of its words, keep the pre-verify version instead.
+    # file lost more than VERIFY_MAX_SHRINK of its words, keep the pre-verify version instead.
     words_after = len(notes.read_text().split())
-    if words_after < words_before * (1 - max_shrink):
+    if words_after < words_before * (1 - VERIFY_MAX_SHRINK):
         rejected = workdir / "notes.verify-rejected.md"
         shutil.copy2(notes, rejected)
         shutil.copy2(snapshot, notes)
         logger.warning(
             "  verify shrank notes.md from %d to %d words (> %d%% loss) — restored the pre-verify version; "
-            "the rejected edit is kept as %s", words_before, words_after, int(max_shrink * 100), rejected.name,
+            "the rejected edit is kept as %s", words_before, words_after, int(VERIFY_MAX_SHRINK * 100), rejected.name,
         )
     else:
         logger.info("  updated %s (%d -> %d words)", notes, words_before, words_after)
 
 
-# =========================================================================================
-# 9. RENDER  (future: conf_notes/render.py + assets/*.css)
-# =========================================================================================
-
 # --- PDF styling (WeasyPrint: pure HTML/CSS -> PDF, no LaTeX install required) ---------
-# Margins, font sizes and font family are Config.render values; the CSS below is a template.
+PDF_MARGIN = "2cm"
+PDF_FONT_SIZE = "12pt"             # notes.pdf
+TRANSCRIPT_PDF_FONT_SIZE = "10pt"  # transcript.pdf — smaller since it's raw reference text, not the primary read
+PDF_FONT_FAMILY = "Georgia, 'Times New Roman', serif"
+
 # Spacing tightened for density (smaller line-height and margins throughout) so notes.pdf
 # fits more per page instead of reading like a print-book layout.
 PDF_CSS = """\
@@ -1765,7 +1534,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 def _markdown_to_html(md_text: str) -> str:
-    markdown, _ = _try_import("markdown")
     if markdown is None:
         raise RuntimeError("markdown not installed. Run: pip install markdown")
     md = markdown.Markdown(extensions=["markdown.extensions.extra", "markdown.extensions.sane_lists", "markdown.extensions.smarty"])
@@ -1788,15 +1556,14 @@ def _text_to_html(text: str, title: str) -> str:
     return "\n".join(body)
 
 
-def _render_pdf(html_body: str, dest: Path, render: RenderSettings, font_size: str | None = None) -> None:
-    weasyprint, error = _try_import("weasyprint")
+def _render_pdf(html_body: str, dest: Path, font_size: str = PDF_FONT_SIZE) -> None:
     if weasyprint is None:
         raise RuntimeError(
-            f"weasyprint could not be imported ({error}). This is almost always a "
+            f"weasyprint could not be imported ({WEASYPRINT_IMPORT_ERROR}). This is almost always a "
             f"native-library path issue, not a missing pip install — see check_environment()'s message "
             f"at startup for the fix."
         )
-    css = PDF_CSS.format(margin=render.margin, font_size=font_size or render.font_size, font_family=render.font_family)
+    css = PDF_CSS.format(margin=PDF_MARGIN, font_size=font_size, font_family=PDF_FONT_FAMILY)
     weasyprint.HTML(string=HTML_TEMPLATE.format(css=css, body=html_body)).write_pdf(str(dest))
     logger.info("  wrote %s", dest)
 
@@ -1812,96 +1579,59 @@ def _render_html(html_body: str, dest: Path) -> None:
     logger.info("  wrote %s", dest)
 
 
-def stage_pdf(ctx: RunContext) -> None:
-    cfg, workdir, run_name = ctx.cfg, ctx.workdir, ctx.run_name
+def stage_pdf(workdir: Path, run_name: str) -> None:
+    logger.info("[7/7] Rendering PDF/HTML outputs (WeasyPrint)")
 
     notes_html_body = _markdown_to_html((workdir / "notes.md").read_text())
-    _render_pdf(notes_html_body, workdir / "notes.pdf", cfg.render)
+    _render_pdf(notes_html_body, workdir / "notes.pdf")
     _render_html(notes_html_body, workdir / "notes.html")
 
     transcript_text = (workdir / "transcript.txt").read_text()
-    _render_pdf(
-        _text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf",
-        cfg.render, font_size=cfg.render.transcript_font_size,
-    )
+    _render_pdf(_text_to_html(transcript_text, f"Trascrizione — {run_name}"), workdir / "transcript.pdf", font_size=TRANSCRIPT_PDF_FONT_SIZE)
 
-    out_dir = cfg.paths.output
-    out_dir.mkdir(parents=True, exist_ok=True)
     dests = {
-        "notes.md": out_dir / f"{run_name}-notes.md",
-        "notes.pdf": out_dir / f"{run_name}-notes.pdf",
-        "notes.html": out_dir / f"{run_name}-notes.html",
-        "transcript.pdf": out_dir / f"{run_name}-transcript.pdf",
+        "notes.md": OUTPUT_DIR / f"{run_name}-notes.md",
+        "notes.pdf": OUTPUT_DIR / f"{run_name}-notes.pdf",
+        "notes.html": OUTPUT_DIR / f"{run_name}-notes.html",
+        "transcript.pdf": OUTPUT_DIR / f"{run_name}-transcript.pdf",
     }
     for src_name, dest in dests.items():
         shutil.copy2(workdir / src_name, dest)
-    logger.info("  copied %d output files to %s", len(dests), out_dir)
+    logger.info("  copied 4 output files to %s", OUTPUT_DIR)
     for dest in dests.values():
         logger.info("    %s", dest)
 
 
-# =========================================================================================
-# 10. PIPELINE  (future: conf_notes/pipeline.py)
-# =========================================================================================
-
-@dataclass(frozen=True)
-class RunContext:
-    """Everything one recording's stages need, passed explicitly instead of via globals."""
-    cfg: Config
-    runner: OpencodeRunner
-    audio: Path
-    workdir: Path
-    run_name: str
-
-    def prompt(self, name: str) -> Path:
-        return self.cfg.paths.prompts / name
+def _require(path: Path, stage_name: str) -> None:
+    if not path.exists() or not path.read_text().strip():
+        raise RuntimeError(f"{stage_name} did not produce {path.name} — check the matching pass log in {path.parent} before continuing.")
+    # Belt-and-suspenders: whatever opencode/the model wrote, make sure it doesn't
+    # contain a line opencode itself can't fully read back in a later stage (see
+    # ensure_no_long_lines() for why this can't be guaranteed by prompt instructions
+    # alone).
+    ensure_no_long_lines(path)
 
 
-@dataclass(frozen=True)
-class Stage:
-    """One pipeline step. `requires` = files (in the run's workdir) that must already exist
-    to START at this stage, i.e. what --from-stage needs (irrelevant for a normal full run,
-    where the prior stage just wrote them).
-
-    Only "cleanup" and "extract" need the (raw/cleaned) transcript text. From "synthesize"
-    onward, extract.md's "Speaker's claims & arguments" section is already a
-    compressed-but-complete sentence-by-sentence record of the talk, so the full transcript
-    isn't re-attached to later opencode calls (it's long, and re-sending it burns tokens
-    for no extra information opencode doesn't already have via extract.md)."""
-    name: str
-    title: str
-    run: Callable[[RunContext], None]
-    requires: tuple[str, ...] = ()
+STAGE_RETRY_ATTEMPTS = 3
+STAGE_RETRY_SLEEP_SECONDS = 15  # pause after an ordinary failure; provider rate limits use their own hinted delay
 
 
-# The single source of truth for stage order, CLI choices, resume prerequisites and the
-# "[n/N]" progress labels. To add a stage: write stage_xxx(ctx) and add one line here.
-STAGES: tuple[Stage, ...] = (
-    Stage("transcribe", "Transcribing audio", stage_transcribe),
-    Stage("cleanup", "Pass 0: transcript cleanup (de-loop in Python + chunked LLM pass)", stage_cleanup,
-          requires=("transcript-raw.txt",)),
-    Stage("extract", "Pass 1: extraction (transcript-only, no outside knowledge)", stage_extract,
-          requires=("transcript.txt",)),
-    Stage("enrich", "Pass 2: multi-source enrichment", stage_enrich,
-          requires=("extract.md",)),
-    Stage("synthesize", "Pass 3: synthesis into full academic notes (no info dropped)", stage_synthesize,
-          requires=("extract.md", "background.md")),
-    Stage("verify", "Pass 4: verification (fixes doubtful sentences in place, deletes nothing)", stage_verify,
-          requires=("notes.md",)),
-    Stage("pdf", "Rendering PDF/HTML outputs (WeasyPrint)", stage_pdf,
-          requires=("notes.md", "transcript.txt")),
-)
-STAGE_NAMES: tuple[str, ...] = tuple(s.name for s in STAGES)
-assert len(set(STAGE_NAMES)) == len(STAGE_NAMES), "duplicate stage name in STAGES"
+class StagePermanentError(RuntimeError):
+    """A stage failure that re-running the same stage against the same on-disk inputs
+    can never fix (e.g. a required upstream file has content the parser can't use).
+    Distinct from a plain RuntimeError, which may be a flaky opencode call/timeout
+    worth retrying. Raise this instead of RuntimeError for that kind of failure so
+    _run_stage_with_retry() fails fast instead of burning 3 retries x 60s on an error
+    that will reproduce identically every time."""
 
 
-def _run_stage_with_retry(ctx: RunContext, stage: Stage):
-    """Run one stage, retrying up to cfg.retry.stage_attempts times with a
-    cfg.retry.stage_sleep_seconds pause between attempts if it raises.
+def _run_stage_with_retry(stage_name: str, func, *args, **kwargs):
+    """Run a stage function, retrying up to STAGE_RETRY_ATTEMPTS times with a
+    STAGE_RETRY_SLEEP_SECONDS pause between attempts if it raises.
 
     Retries RuntimeError (opencode exited non-zero, or _require() found a stage "did
     not produce" its expected output file) and TimeoutError (opencode exceeded
-    cfg.opencode_timeout_seconds) — both can plausibly succeed on a later attempt.
+    OPENCODE_TIMEOUT_SECONDS) — both can plausibly succeed on a later attempt.
     StagePermanentError is NOT retried: it means the failure is deterministic given
     the current on-disk inputs (e.g. stage_enrich() finding no parseable items in
     extract.md), so retrying without anything changing would just fail identically
@@ -1909,71 +1639,78 @@ def _run_stage_with_retry(ctx: RunContext, stage: Stage):
     process_file()'s own error handling (logging + sys.exit / batch "failures" list)
     still runs exactly as before.
     """
-    retry, rate = ctx.cfg.retry, ctx.cfg.rate
     last_exc: Exception | None = None
-    for attempt in range(1, retry.stage_attempts + 1):
+    for attempt in range(1, STAGE_RETRY_ATTEMPTS + 1):
         try:
-            return stage.run(ctx)
+            return func(*args, **kwargs)
         except StagePermanentError:
             raise
         except (RuntimeError, TimeoutError) as e:
             last_exc = e
-            if attempt < retry.stage_attempts:
+            if attempt < STAGE_RETRY_ATTEMPTS:
                 if isinstance(e, OpencodeRateLimit):
                     # Wait exactly what the provider asked for (+2s margin) instead of a fixed guess.
-                    delay = min(e.retry_after + 2, rate.max_wait_seconds)
+                    delay = min(e.retry_after + 2, RATE_LIMIT_MAX_WAIT_SECONDS)
                 else:
-                    delay = retry.stage_sleep_seconds
+                    delay = STAGE_RETRY_SLEEP_SECONDS
                 logger.warning(
                     "  [%s] attempt %d/%d failed (%s) — sleeping %.0fs before retry",
-                    stage.name, attempt, retry.stage_attempts, e, delay,
+                    stage_name, attempt, STAGE_RETRY_ATTEMPTS, e, delay,
                 )
                 time.sleep(delay)
-                ctx.runner.throttle.reset()
+                THROTTLE.reset()
             else:
-                logger.error("  [%s] failed after %d attempts", stage.name, retry.stage_attempts)
+                logger.error("  [%s] failed after %d attempts", stage_name, STAGE_RETRY_ATTEMPTS)
     raise last_exc
 
 
-def _check_resume_prereqs(workdir: Path, stage: Stage) -> None:
+def _check_resume_prereqs(workdir: Path, from_stage: str) -> None:
     """When resuming with --from-stage, fail fast with a clear message if the files that
     stage depends on aren't already in workdir, instead of letting opencode run against
     a missing --file attachment."""
-    missing = [f for f in stage.requires if not (workdir / f).exists()]
+    missing = [f for f in STAGE_REQUIRES.get(from_stage, []) if not (workdir / f).exists()]
     if missing:
-        raise RuntimeError(f"--from-stage {stage.name} requires {', '.join(missing)} to already exist in {workdir}, but they don't. Run from an earlier stage first.")
+        raise RuntimeError(f"--from-stage {from_stage} requires {', '.join(missing)} to already exist in {workdir}, but they don't. Run from an earlier stage first.")
 
 
-def _run_pipeline_stages(ctx: RunContext, from_stage: str) -> None:
-    """Run stages from_stage..end for one file. Each stage already retries transient
+def _run_pipeline_stages(audio: Path, workdir: Path, run_name: str, args: argparse.Namespace, from_stage: str) -> None:
+    """Run stages from_stage..pdf for one file. Each stage already retries transient
     failures internally (_run_stage_with_retry); if a stage still fails after that, this
     raises and lets the caller decide whether to restart the whole sequence."""
-    start = STAGE_NAMES.index(from_stage)
+    start = STAGES.index(from_stage)
     if start > 0:
-        _check_resume_prereqs(ctx.workdir, STAGES[start])
+        _check_resume_prereqs(workdir, from_stage)
 
-    for number, stage in enumerate(STAGES, 1):
-        if number - 1 < start:
-            continue
-        logger.info("[%d/%d] %s", number, len(STAGES), stage.title)
-        _run_stage_with_retry(ctx, stage)
+    if start <= STAGES.index("transcribe"):
+        _run_stage_with_retry("transcribe", stage_transcribe, audio, workdir, args.whisper_model)
+    if start <= STAGES.index("cleanup"):
+        _run_stage_with_retry("cleanup", stage_cleanup, workdir, args.model_cleanup)
+    if start <= STAGES.index("extract"):
+        _run_stage_with_retry("extract", stage_extract, workdir, args.model_fast)
+    if start <= STAGES.index("enrich"):
+        _run_stage_with_retry("enrich", stage_enrich, workdir, args.model_fast)
+    if start <= STAGES.index("synthesize"):
+        _run_stage_with_retry("synthesize", stage_synthesize, workdir, args.model_strong, derive_date_from_filename(audio))
+    if start <= STAGES.index("verify"):
+        _run_stage_with_retry("verify", stage_verify, workdir, args.model_strong)
+    if start <= STAGES.index("pdf"):
+        _run_stage_with_retry("pdf", stage_pdf, workdir, run_name)
 
 
-def process_file(audio: Path, cfg: Config, runner: OpencodeRunner, from_stage: str) -> None:
+def process_file(audio: Path, args: argparse.Namespace, from_stage: str) -> None:
     run_name = audio.stem
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    logfile = cfg.paths.logs / f"{timestamp}_{run_name}.log"
-    setup_logging(logfile, cfg.verbose)
+    logfile = LOG_DIR / f"{timestamp}_{run_name}.log"
+    setup_logging(logfile, args.verbose)
 
     logger.info("=== Processing %s ===", audio.name)
     logger.debug("Log file: %s", logfile)
 
-    workdir = cfg.paths.work / run_name
+    workdir = WORK_DIR / run_name
     workdir.mkdir(parents=True, exist_ok=True)
-    ctx = RunContext(cfg=cfg, runner=runner, audio=audio, workdir=workdir, run_name=run_name)
 
     try:
-        _run_pipeline_stages(ctx, from_stage)
+        _run_pipeline_stages(audio, workdir, run_name, args, from_stage)
     except (RuntimeError, TimeoutError) as e:
         # A stage exhausted its own retries. This doesn't necessarily mean the
         # situation is truly unfixable — re-running the earlier stages from scratch can
@@ -1994,12 +1731,12 @@ def process_file(audio: Path, cfg: Config, runner: OpencodeRunner, from_stage: s
         if from_stage == "transcribe" and raw_transcript.exists() and raw_transcript.read_text().strip():
             restart_from = "cleanup"  # don't redo an hour of Whisper for a failure in a later stage
             logger.info("  transcript-raw.txt already exists — restarting from 'cleanup' instead of re-transcribing")
-        time.sleep(cfg.retry.stage_sleep_seconds)
-        _run_pipeline_stages(ctx, restart_from)
+        time.sleep(STAGE_RETRY_SLEEP_SECONDS)
+        _run_pipeline_stages(audio, workdir, run_name, args, restart_from)
 
-    if not cfg.keep_input and from_stage == "transcribe":
+    if not args.keep_input and from_stage == "transcribe":
         try:
-            inside_input_dir = audio.parent.resolve() == cfg.paths.input.resolve()
+            inside_input_dir = audio.parent.resolve() == INPUT_DIR.resolve()
         except OSError:
             inside_input_dir = False
         if inside_input_dir:
@@ -2009,31 +1746,27 @@ def process_file(audio: Path, cfg: Config, runner: OpencodeRunner, from_stage: s
             shutil.move(str(audio), str(dest))
             logger.info("Moved %s -> %s", audio.name, dest)
         else:
-            logger.debug("Not moving %s to processed/ (outside the input folder)", audio)
+            logger.debug("Not moving %s to processed/ (outside INPUT_DIR)", audio)
 
     logger.info("Done with %s.", audio.name)
-    logger.info("  4 output files in: %s", cfg.paths.output)
+    logger.info("  4 output files in: %s", OUTPUT_DIR)
     logger.info("  Intermediate files kept in: %s", workdir)
 
 
-# =========================================================================================
-# 11. CLI  (future: conf_notes/cli.py)
-# =========================================================================================
-
-def check_environment(cfg: Config) -> None:
+def check_environment() -> None:
     """Ensure the working folders exist, and fail fast with a clear message if a
     required binary/package is missing — rather than discovering it after transcribing a
     1-hour recording."""
-    cfg.paths.ensure()
+    for path in (INPUT_DIR, OUTPUT_DIR, LOG_DIR):
+        path.mkdir(parents=True, exist_ok=True)
 
     problems = []
     if shutil.which("opencode") is None:
         problems.append("`opencode` not found on PATH — required for cleanup/extract/enrich/synthesize/verify. Install it, then run `opencode auth login` for your provider(s).")
 
-    weasyprint, weasyprint_error = _try_import("weasyprint")
     if weasyprint is None:
         problems.append(
-            f"weasyprint could not be loaded ({weasyprint_error}). On macOS this is almost always "
+            f"weasyprint could not be loaded ({WEASYPRINT_IMPORT_ERROR}). On macOS this is almost always "
             "WeasyPrint failing to find its native libraries (pango/cairo/gdk-pixbuf) installed via "
             "Homebrew, not a missing `pip install`. Fix:\n"
             "      brew install cairo pango gdk-pixbuf libffi\n"
@@ -2041,9 +1774,9 @@ def check_environment(cfg: Config) -> None:
             "    Add that export to your ~/.zshrc so it's set for every future run. Full troubleshooting: "
             "https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#troubleshooting"
         )
-    if _try_import("markdown")[0] is None:
+    if markdown is None:
         problems.append("`markdown` not installed — required to render notes.md. Run: pip install markdown")
-    if _try_import("mlx_whisper")[0] is None:
+    if mlx_whisper is None:
         problems.append("mlx-whisper isn't installed — it's the only transcription backend now. Run: pip install mlx-whisper")
     elif shutil.which("ffmpeg") is None:
         problems.append("`ffmpeg` not found on PATH — mlx-whisper needs it to decode audio. Run: brew install ffmpeg")
@@ -2055,76 +1788,53 @@ def check_environment(cfg: Config) -> None:
         sys.exit(1)
 
 
-def build_parser(defaults: Config) -> argparse.ArgumentParser:
-    """`defaults` is the Config built from the environment; it is only used to show the
-    effective defaults in --help. CLI values are applied afterwards via Config.with_overrides()."""
-    m = defaults.models
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--file", type=Path, default=None, help="Process a single audio file instead of scanning the input folder")
+    parser.add_argument("--file", type=Path, default=None, help="Process a single audio file instead of scanning INPUT_DIR")
     parser.add_argument(
-        "--model-fast", default=None,
-        help=f"Model for the extract AND enrich passes, as provider/model (env: OPENCODE_MODEL_FAST; "
-             f"current: extract={m.extract}, enrich={m.enrich}).",
+        "--model-fast", default=os.environ.get("OPENCODE_MODEL_FAST"),
+        help=f"Model for extract/enrich passes (env: OPENCODE_MODEL_FAST), as provider/model. Does NOT affect "
+             f"cleanup (pass 0) — use --model-cleanup for that.",
     )
     parser.add_argument(
         "--model-cleanup", default=None,
-        help=f"Model for the cleanup pass, as provider/model (env: OPENCODE_MODEL_CLEANUP; current: {m.cleanup}). "
+        help=f"Model for the cleanup pass, as provider/model (env: OPENCODE_MODEL_CLEANUP; default: {CLEANUP_MODEL}). "
              f"Use a local ollama/... model to keep that pass fully offline.",
     )
-    parser.add_argument(
-        "--model-strong", default=None,
-        help=f"Model for the synthesize AND verify passes, as provider/model (env: OPENCODE_MODEL_STRONG; "
-             f"current: synthesize={m.synthesize}, verify={m.verify}).",
-    )
-    parser.add_argument("--whisper-model", default=None, help=f"MLX Whisper model (current: {m.whisper})")
-    parser.add_argument("--from-stage", choices=STAGE_NAMES, default="transcribe", help="Resume from this stage (requires --file; reuses existing intermediate files)")
-    parser.add_argument("--keep-input", action="store_true", help="Don't move processed files into <input>/processed/")
+    parser.add_argument("--model-strong", default=os.environ.get("OPENCODE_MODEL_STRONG"), help="Model for synthesize/verify passes, as provider/model (env: OPENCODE_MODEL_STRONG)")
+    parser.add_argument("--whisper-model", default=WHISPER_MODEL_DEFAULT, help=f"MLX Whisper model (default: {WHISPER_MODEL_DEFAULT})")
+    parser.add_argument("--from-stage", choices=STAGES, default="transcribe", help="Resume from this stage (requires --file; reuses existing intermediate files)")
+    parser.add_argument("--keep-input", action="store_true", help="Don't move processed files into INPUT_DIR/processed/")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print debug-level logs to console")
-    return parser
+    args = parser.parse_args()
 
-
-def main(argv: list[str] | None = None) -> None:
-    try:
-        base = Config.from_env()
-    except ConfigError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
-        sys.exit(2)
-
-    parser = build_parser(base)
-    args = parser.parse_args(argv)
     if args.from_stage != "transcribe" and args.file is None:
         parser.error("--from-stage other than 'transcribe' requires --file")
 
-    cfg = base.with_overrides(
-        model_fast=args.model_fast, model_strong=args.model_strong, model_cleanup=args.model_cleanup,
-        whisper_model=args.whisper_model, keep_input=args.keep_input or None, verbose=args.verbose or None,
-    )
-    configure_environment(cfg)   # before anything imports mlx_whisper / huggingface_hub
-    check_environment(cfg)
-    runner = OpencodeRunner(cfg)
+    check_environment()
 
     if args.file is not None:
         audio = args.file.resolve()
         if args.from_stage == "transcribe" and not audio.exists():
             parser.error(f"Audio file not found: {audio}")
         try:
-            process_file(audio, cfg, runner, args.from_stage)
+            process_file(audio, args, args.from_stage)
         except Exception as e:
             logger.error("%s", e)
             sys.exit(1)
         return
 
-    # Batch mode: scan the input folder, process one file at a time.
-    audio_files = discover_audio_files(cfg.paths.input, cfg.audio_extensions)
+    # Batch mode: scan INPUT_DIR, process one file at a time.
+    audio_files = discover_audio_files(INPUT_DIR)
     if not audio_files:
-        print(f"No audio files found in {cfg.paths.input}")
+        print(f"No audio files found in {INPUT_DIR}")
         return
 
-    print(f"Found {len(audio_files)} file(s) in {cfg.paths.input}. Processing one at a time...")
+    print(f"Found {len(audio_files)} file(s) in {INPUT_DIR}. Processing one at a time...")
     failures = []
     for audio in audio_files:
         try:
-            process_file(audio, cfg, runner, "transcribe")
+            process_file(audio, args, "transcribe")
         except TimeoutError as e:
             logger.error("FATAL: %s", e)
             raise
