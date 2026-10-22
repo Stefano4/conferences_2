@@ -131,7 +131,7 @@ OPENCODE_TIMEOUT_SECONDS = int(os.environ.get("OPENCODE_TIMEOUT_SECONDS", "1800"
 #   - the inter-call TPM sleep is skipped, since it only exists for cloud rate limits.
 ENRICH_MODEL = GEMINI_31_LOW   # LOCAL_MODEL GEMINI_MODEL_2
 BATCH_SIZE = 8             # items per opencode call when ENRICH_MODEL is a cloud model
-ENRICH_BATCH_SIZE_LOCAL = 1  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
+ENRICH_BATCH_SIZE_LOCAL = 8  # items per opencode call when ENRICH_MODEL is LOCAL_MODEL
 
 # --- Pass 0 (cleanup) and rate-limit settings -------------------------------------------
 CLEANUP_MODEL = os.environ.get("OPENCODE_MODEL_CLEANUP", GEMINI_LATEST_LOW)
